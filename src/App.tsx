@@ -711,7 +711,7 @@ export default function App() {
             const stageController = new AbortController();
             const onAbort = () => stageController.abort();
             runController.signal.addEventListener("abort", onAbort, { once: true });
-            const timer = setTimeout(() => stageController.abort(), 38000);
+            const timer = setTimeout(() => stageController.abort(), 54000);
 
             let res: Response;
             try {
@@ -773,9 +773,9 @@ export default function App() {
                     "Esta etapa excedió el tiempo máximo de respuesta. Tu avance previo quedó guardado para continuar desde aquí."
                   )
                 : err;
-            if (attempt < 2 && !isAbortTimeout && elapsedMs < 8000) {
+            if (attempt < 2 && !isAbortTimeout && elapsedMs < 10000) {
               setReconnecting(true);
-              await new Promise((r) => setTimeout(r, 900));
+              await new Promise((r) => setTimeout(r, 1400));
               continue;
             }
             break;
@@ -1915,6 +1915,75 @@ export default function App() {
             <p className="text-xs text-brand-text-muted font-serif italic text-center border-t border-brand-border pt-3">
               Si la red cae o recargas la página, el motor retomará exactamente desde la última etapa sin completar.
             </p>
+          </section>
+        )}
+
+        {/* Mobile recovery banner when paused/error occurs while Resultados tab is active */}
+        {!loading && !analysis && (errorMsg || (activeJob && activeJob.completedStages.length < ANALYSIS_STAGE_ORDER.length)) && (
+          <section
+            className={`${
+              mobileNavTab === "resultados" ? "flex md:hidden" : "hidden"
+            } bg-sem-amber-bg border border-sem-amber-border p-4 rounded-2xl text-xs flex-col gap-3`}
+          >
+            <div className="flex items-start gap-2.5 min-w-0">
+              <AlertTriangle className="w-4 h-4 shrink-0 text-sem-amber mt-0.5" />
+              <div className="min-w-0 space-y-1">
+                <div className="font-bold text-sem-amber">
+                  {activeJob
+                    ? `Progreso guardado (${activeJob.completedStages.length}/${ANALYSIS_STAGE_ORDER.length} etapas completadas)`
+                    : "Aviso del Sistema"}
+                </div>
+                <p className="text-brand-text break-words">
+                  {errorMsg ||
+                    activeJob?.errorMessage ||
+                    "El análisis quedó en pausa. Puedes reanudarlo exactamente donde se quedó."}
+                </p>
+              </div>
+            </div>
+            <div className="flex flex-wrap items-center gap-2">
+              {activeJob ? (
+                <>
+                  <button
+                    type="button"
+                    onClick={() => handleResumeSavedJob(activeJob)}
+                    className="flex items-center gap-1.5 px-3.5 py-2 bg-brand-gold text-slate-950 hover:bg-brand-gold-hover font-bold text-xs rounded-lg transition cursor-pointer"
+                  >
+                    <Play className="w-3.5 h-3.5" />
+                    <span>
+                      Continuar (Etapa {Math.min(activeJob.completedStages.length + 1, ANALYSIS_STAGE_ORDER.length)}/
+                      {ANALYSIS_STAGE_ORDER.length})
+                    </span>
+                  </button>
+                  {activeJob.completedStages.length > 0 && (
+                    <button
+                      type="button"
+                      onClick={handleViewPartialProgress}
+                      className="flex items-center gap-1.5 px-3 py-2 bg-brand-card border border-brand-border text-brand-text font-semibold text-xs rounded-lg transition cursor-pointer"
+                    >
+                      <Eye className="w-3.5 h-3.5 text-brand-gold" />
+                      <span>Ver avance</span>
+                    </button>
+                  )}
+                  <button
+                    type="button"
+                    onClick={handleDiscardSavedJob}
+                    className="flex items-center gap-1.5 px-3 py-2 bg-brand-bg border border-brand-border text-brand-text-muted font-semibold text-xs rounded-lg transition cursor-pointer"
+                  >
+                    <X className="w-3.5 h-3.5" />
+                    <span>Descartar</span>
+                  </button>
+                </>
+              ) : (
+                <button
+                  type="button"
+                  onClick={() => handleAnalyze()}
+                  className="flex items-center gap-1.5 px-3.5 py-2 bg-brand-gold text-slate-950 font-bold text-xs rounded-lg transition cursor-pointer"
+                >
+                  <RefreshCw className="w-3.5 h-3.5" />
+                  <span>Reintentar ahora</span>
+                </button>
+              )}
+            </div>
           </section>
         )}
 

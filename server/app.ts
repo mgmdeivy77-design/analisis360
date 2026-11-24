@@ -3,7 +3,7 @@ import crypto from "crypto";
 import fs from "fs";
 import os from "os";
 import path from "path";
-import { GoogleGenAI, ThinkingLevel } from "@google/genai";
+import { GoogleGenAI } from "@google/genai";
 import dotenv from "dotenv";
 import {
   ANALYSIS_STAGE_ORDER,
@@ -251,6 +251,49 @@ interface ModelAttemptTrace {
   error?: string;
 }
 
+const VERIFIED_FLASH_MODELS = [
+  "gemini-4-hydrogen",
+  "gemini-3.5-flash",
+  "gemini-3.1-flash-lite",
+  "gemini-3.8-flash",
+  "gemini-3.6-flash",
+  "gemini-3.7-flash",
+  "gemini-3.5-flash-lite",
+] as const;
+
+const MODEL_COOLDOWN_MS = 90_000;
+const modelCooldownUntil = new Map<string, number>();
+let lastHealthyModel: string | null = null;
+
+function getOrderedModelPool(primaryModel?: string, fallbackModel?: string): string[] {
+  const baseList = Array.from(
+    new Set(
+      [primaryModel, fallbackModel, ...VERIFIED_FLASH_MODELS].filter(
+        (m): m is string => Boolean(m)
+      )
+    )
+  );
+  const now = Date.now();
+  const healthy: string[] = [];
+  const cooled: string[] = [];
+
+  for (const m of baseList) {
+    const until = modelCooldownUntil.get(m) || 0;
+    if (until > now) {
+      cooled.push(m);
+    } else {
+      healthy.push(m);
+    }
+  }
+
+  if (lastHealthyModel && healthy.includes(lastHealthyModel)) {
+    const promoted = healthy.filter((m) => m !== lastHealthyModel);
+    return [lastHealthyModel, ...promoted, ...cooled];
+  }
+
+  return [...healthy, ...cooled];
+}
+
 async function generateContentWithRetryAndFallback(
   ai: GoogleGenAI,
   primaryModel: string,
@@ -311,9 +354,8 @@ async function generateContentWithRetryAndFallback(
     return Boolean(isTransient);
   };
 
-  const modelsToTry = Array.from(
-    new Set([primaryModel, fallbackModel, "gemini-4-hydrogen", "gemini-3.1-flash-lite"])
-  );
+  const modelsToTry = getOrderedModelPool(primaryModel, fallbackModel);
+  const globalDeadline = Date.now() + 42000;
   let lastError: any = null;
   let anyTransient = false;
   let anyTimeout = false;
@@ -321,125 +363,111 @@ async function generateContentWithRetryAndFallback(
   const labelPrefix = options?.stageLabel ? `[${options.stageLabel}] ` : "";
 
   for (let i = 0; i < modelsToTry.length; i++) {
+    const remainingBudgetMs = globalDeadline - Date.now();
+    if (remainingBudgetMs < 5000) {
+      break;
+    }
+
     const currentModel = modelsToTry[i];
-    const maxAttemptsForModel = 2;
-    let useThinking = true;
+    const startedAt = Date.now();
+    const firstChunkTimeoutMs = Math.min(i === 0 ? 14000 : 12000, remainingBudgetMs);
+    const stallTimeoutMs = 12000;
+    const hardCapMs = Math.min(26000, remainingBudgetMs);
+    const controller = new AbortController();
+    let inactivityTimer: ReturnType<typeof setTimeout> | undefined;
+    let hardCapTimer: ReturnType<typeof setTimeout> | undefined;
+    let timeoutReason = "";
 
-    for (let attempt = 1; attempt <= maxAttemptsForModel; attempt++) {
-      const startedAt = Date.now();
-      const firstChunkTimeoutMs = i === 0 ? 11500 : 10500;
-      const stallTimeoutMs = 9000;
-      const hardCapMs = i === 0 ? 22000 : 20000;
-      const controller = new AbortController();
-      let inactivityTimer: ReturnType<typeof setTimeout> | undefined;
-      let hardCapTimer: ReturnType<typeof setTimeout> | undefined;
-      let timeoutReason = "";
+    const resetInactivityTimer = (msLimit: number) => {
+      if (inactivityTimer) clearTimeout(inactivityTimer);
+      inactivityTimer = setTimeout(() => {
+        timeoutReason = `Timeout de respuesta en ${currentModel} tras ${Math.round((Date.now() - startedAt) / 1000)}s`;
+        controller.abort();
+      }, msLimit);
+    };
 
-      const resetInactivityTimer = (msLimit: number) => {
-        if (inactivityTimer) clearTimeout(inactivityTimer);
-        inactivityTimer = setTimeout(() => {
-          timeoutReason = `Timeout de respuesta en ${currentModel} tras ${Math.round((Date.now() - startedAt) / 1000)}s`;
-          controller.abort();
-        }, msLimit);
-      };
+    try {
+      console.log(`[Gemini API] ${labelPrefix}Streaming con ${currentModel} (pool ${i + 1}/${modelsToTry.length})...`);
 
-      try {
-        console.log(`[Gemini API] ${labelPrefix}Streaming con ${currentModel} (intento ${attempt}/${maxAttemptsForModel})...`);
+      hardCapTimer = setTimeout(() => {
+        timeoutReason = `Tiempo límite de etapa alcanzado en ${currentModel} (${Math.round(hardCapMs / 1000)}s)`;
+        controller.abort();
+      }, hardCapMs);
+      resetInactivityTimer(firstChunkTimeoutMs);
 
-        hardCapTimer = setTimeout(() => {
-          timeoutReason = `Tiempo límite de etapa alcanzado en ${currentModel} (${hardCapMs / 1000}s)`;
-          controller.abort();
-        }, hardCapMs);
-        resetInactivityTimer(firstChunkTimeoutMs);
-
-        const config: Record<string, any> = {
+      const stream = await ai.models.generateContentStream({
+        model: currentModel,
+        contents: userPrompt,
+        config: {
           abortSignal: controller.signal,
           systemInstruction,
           responseMimeType: "application/json",
-        };
-        if (useThinking) {
-          config.thinkingConfig = {
-            thinkingLevel:
-              currentModel === "gemini-3.1-flash-lite"
-                ? ThinkingLevel.MINIMAL
-                : ThinkingLevel.LOW,
-          };
-        }
+        },
+      });
 
-        const stream = await ai.models.generateContentStream({
-          model: currentModel,
-          contents: userPrompt,
-          config,
-        });
-
-        let responseText = "";
-        for await (const chunk of stream) {
-          if (controller.signal.aborted) {
-            throw new Error(timeoutReason || `Timeout de respuesta en ${currentModel}`);
-          }
-          const part = chunk?.text || "";
-          if (part) {
-            responseText += part;
-            resetInactivityTimer(stallTimeoutMs);
-          }
-        }
-
-        if (controller.signal.aborted && !responseText.trim()) {
+      let responseText = "";
+      for await (const chunk of stream) {
+        if (controller.signal.aborted) {
           throw new Error(timeoutReason || `Timeout de respuesta en ${currentModel}`);
         }
-
-        const ms = Date.now() - startedAt;
-
-        if (!responseText || !responseText.trim()) {
-          throw new Error(`Respuesta vacía del modelo ${currentModel}.`);
+        const part = chunk?.text || "";
+        if (part) {
+          responseText += part;
+          resetInactivityTimer(stallTimeoutMs);
         }
-
-        const parsedJson = safeParseModelJson(responseText);
-        if (!parsedJson) {
-          throw new Error(`El modelo ${currentModel} generó un formato no estándar.`);
-        }
-
-        console.log(`[Gemini API] ${labelPrefix}Completado con ${currentModel} en ${ms}ms`);
-        trace.push({ model: currentModel, ms, ok: true });
-        return { response: { text: responseText }, parsedJson, modelUsed: currentModel, trace };
-      } catch (error: any) {
-        const ms = Date.now() - startedAt;
-        const effectiveMsg = timeoutReason || String(error?.message || "error");
-        const errMsg = effectiveMsg.slice(0, 200);
-        trace.push({ model: currentModel, ms, ok: false, error: errMsg });
-        lastError = timeoutReason ? new Error(timeoutReason) : error;
-        const isTransient = checkIsTransient(lastError);
-        const isTimedOut = Boolean(timeoutReason) || errMsg.toLowerCase().includes("timeout") || errMsg.toLowerCase().includes("aborted");
-        if (isTransient) anyTransient = true;
-        if (isTimedOut) anyTimeout = true;
-
-        console.log(`[Gemini API] ${labelPrefix}Error en ${currentModel} (${ms}ms): ${errMsg}`);
-
-        if (useThinking && errMsg.toLowerCase().includes("thinking")) {
-          useThinking = false;
-          if (attempt < maxAttemptsForModel) continue;
-        }
-
-        // Retry same model ONLY if failure was fast (< 2.5s) and transient; if timed out, move straight to fallback model
-        if (attempt < maxAttemptsForModel && isTransient && !isTimedOut && ms < 2500) {
-          const jitter = Math.floor(Math.random() * 300);
-          await new Promise((r) => setTimeout(r, 450 + jitter));
-          continue;
-        }
-        break;
-      } finally {
-        if (inactivityTimer) clearTimeout(inactivityTimer);
-        if (hardCapTimer) clearTimeout(hardCapTimer);
       }
+
+      if (controller.signal.aborted && !responseText.trim()) {
+        throw new Error(timeoutReason || `Timeout de respuesta en ${currentModel}`);
+      }
+
+      const ms = Date.now() - startedAt;
+
+      if (!responseText || !responseText.trim()) {
+        throw new Error(`Respuesta vacía del modelo ${currentModel}.`);
+      }
+
+      const parsedJson = safeParseModelJson(responseText);
+      if (!parsedJson) {
+        throw new Error(`El modelo ${currentModel} generó un formato no estándar.`);
+      }
+
+      lastHealthyModel = currentModel;
+      modelCooldownUntil.delete(currentModel);
+      console.log(`[Gemini API] ${labelPrefix}Completado con ${currentModel} en ${ms}ms`);
+      trace.push({ model: currentModel, ms, ok: true });
+      return { response: { text: responseText }, parsedJson, modelUsed: currentModel, trace };
+    } catch (error: any) {
+      const ms = Date.now() - startedAt;
+      const effectiveMsg = timeoutReason || String(error?.message || "error");
+      const errMsg = effectiveMsg.slice(0, 200);
+      trace.push({ model: currentModel, ms, ok: false, error: errMsg });
+      lastError = timeoutReason ? new Error(timeoutReason) : error;
+      const isTransient = checkIsTransient(lastError);
+      const isTimedOut = Boolean(timeoutReason) || errMsg.toLowerCase().includes("timeout") || errMsg.toLowerCase().includes("aborted");
+      if (isTransient) anyTransient = true;
+      if (isTimedOut) anyTimeout = true;
+
+      if (isTransient || isTimedOut) {
+        modelCooldownUntil.set(currentModel, Date.now() + MODEL_COOLDOWN_MS);
+        if (lastHealthyModel === currentModel) {
+          lastHealthyModel = null;
+        }
+      }
+
+      console.log(`[Gemini API] ${labelPrefix}Rotando desde ${currentModel} (${ms}ms): ${isTimedOut ? "demora excedida" : "indisponibilidad temporal"}`);
+    } finally {
+      if (inactivityTimer) clearTimeout(inactivityTimer);
+      if (hardCapTimer) clearTimeout(hardCapTimer);
     }
   }
 
   const isHighDemand = anyTransient || checkIsTransient(lastError);
   const err: any = new Error(
-    anyTimeout
-      ? "El motor de IA tardó más de lo esperado en responder en esta etapa. Tu avance previo quedó guardado; pulsa 'Continuar' para retomar desde aquí."
-      : isHighDemand
+    isHighDemand && !anyTimeout
       ? "Los servidores de IA están experimentando alta demanda temporal (503). Tu avance previo quedó guardado para continuar sin perder nada."
+      : anyTimeout
+      ? "El motor de IA tardó más de lo esperado en responder en esta etapa. Tu avance previo quedó guardado; pulsa 'Continuar' para retomar desde aquí."
       : `No fue posible completar esta etapa con el motor de IA. Detalle: ${lastError?.message || "Servicio no disponible"}`
   );
   err.trace = trace;
@@ -521,8 +549,9 @@ async function fetchGroundedSourcesForTopic(
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), 4500);
   try {
+    const groundingModel = getOrderedModelPool("gemini-4-hydrogen", "gemini-3.5-flash")[0];
     const genPromise = ai.models.generateContent({
-      model: "gemini-4-hydrogen",
+      model: groundingModel,
       contents: `Encuentra los mejores sitios web oficiales, artículos de referencia, cursos o herramientas confiables en línea sobre: "${topic.slice(0, 200)}"`,
       config: {
         abortSignal: controller.signal,
