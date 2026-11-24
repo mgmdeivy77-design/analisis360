@@ -275,3 +275,34 @@ export interface DictionaryDefinitionResponse {
   categoria: string;
 }
 
+export type AnalysisStageId = "base" | "investigacion" | "decision" | "validacion";
+
+export interface AnalysisStageMeta {
+  id: AnalysisStageId;
+  order: number;
+  title: string;
+  subtitle: string;
+}
+
+export type AnalysisJobStatus = "running" | "completed" | "paused_error";
+
+export interface AnalysisJobStateResponse {
+  jobId: string;
+  status: AnalysisJobStatus;
+  executionMode: "background" | "step-by-step";
+  topic: string;
+  focusType: string;
+  tradicionTeologica: string;
+  completedStages: AnalysisStageId[];
+  currentStage: AnalysisStageId | null;
+  failedStage?: AnalysisStageId | null;
+  totalStages: number;
+  progressPct: number;
+  partialData: Record<string, any>;
+  result?: ComprehensiveAnalysisResponse;
+  error?: string;
+  retryable?: boolean;
+  updatedAt: number;
+}
+
+

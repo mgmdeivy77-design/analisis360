@@ -1,4 +1,6 @@
 import {
+  AnalysisStageId,
+  AnalysisStageMeta,
   ComprehensiveAnalysisResponse,
   DiagnosticTest,
   ResourceCategory,
@@ -962,4 +964,90 @@ export function generateMarkdownReport(rawAnalysis: ComprehensiveAnalysisRespons
 
   return md;
 }
+
+export const ANALYSIS_STAGES: AnalysisStageMeta[] = [
+  {
+    id: "base",
+    order: 1,
+    title: "Comprensión, Síntesis y Contexto 5D",
+    subtitle: "Resumen ejecutivo, problema central, glosario dual y contexto multidisciplinario.",
+  },
+  {
+    id: "investigacion",
+    order: 2,
+    title: "Investigación y Perspectivas",
+    subtitle: "Análisis por disciplinas, contraste de posturas, evidencia y módulos especializados.",
+  },
+  {
+    id: "decision",
+    order: 3,
+    title: "Matriz, Riesgos y Plan de Acción",
+    subtitle: "Alternativas estratégicas, recomendación, riesgos, pasos y checklist.",
+  },
+  {
+    id: "validacion",
+    order: 4,
+    title: "Auditoría, Test y Recursos",
+    subtitle: "Auto-auditoría de sesgos, test diagnóstico, discernimiento y enlaces verificados.",
+  },
+];
+
+export const ANALYSIS_STAGE_ORDER: AnalysisStageId[] = [
+  "base",
+  "investigacion",
+  "decision",
+  "validacion",
+];
+
+const ALLOWED_PARTIAL_ANALYSIS_KEYS = new Set<string>([
+  "resumenEjecutivo",
+  "comprensionProblema",
+  "sintesisClave",
+  "definiciones",
+  "contexto",
+  "analisisMultidisciplinario",
+  "perspectivas",
+  "comparacionObjetiva",
+  "recursosRecomendados",
+  "accionesPracticas",
+  "riesgos",
+  "matrizDecisiones",
+  "recomendacionFinal",
+  "planPasoAPaso",
+  "erroresComunes",
+  "listaVerificacion",
+  "resumenFinal",
+  "esBiblico",
+  "especificosBiblicos",
+  "esCientifico",
+  "especificosCientificos",
+  "auditoriaRazonamiento",
+  "testDiagnostico",
+  "teologiaEvangelica",
+]);
+
+export function filterValidStageIds(raw: unknown): AnalysisStageId[] {
+  if (!Array.isArray(raw)) return [];
+  const validSet = new Set<AnalysisStageId>();
+  for (const item of raw) {
+    if (typeof item === "string" && ANALYSIS_STAGE_ORDER.includes(item as AnalysisStageId)) {
+      validSet.add(item as AnalysisStageId);
+    }
+  }
+  return ANALYSIS_STAGE_ORDER.filter((stageId) => validSet.has(stageId));
+}
+
+export function pickSafePartialAnalysisData(raw: unknown): Record<string, any> {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+    return {};
+  }
+  const safe: Record<string, any> = {};
+  for (const [key, value] of Object.entries(raw as Record<string, any>)) {
+    if (ALLOWED_PARTIAL_ANALYSIS_KEYS.has(key) && value !== undefined) {
+      safe[key] = value;
+    }
+  }
+  return safe;
+}
+
 

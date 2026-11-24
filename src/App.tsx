@@ -7,19 +7,24 @@ import {
   BookOpen,
   Brain,
   Check,
+  CheckCircle2,
   ChevronDown,
   ChevronUp,
+  Clock,
   Compass,
   Contrast,
   Copy,
   Download,
   Eraser,
+  Eye,
   FileCode2,
   FileText,
   Glasses,
   History,
   Layers,
   Moon,
+  PauseCircle,
+  Play,
   Plus,
   Printer,
   RefreshCw,
@@ -28,10 +33,23 @@ import {
   Sparkles,
   Star,
   Trees,
+  WifiOff,
   X,
 } from "lucide-react";
-import { ComprehensiveAnalysisResponse, DictionaryDefinitionResponse } from "./types";
-import { generateMarkdownReport, sanitizeAnalysisResponse } from "./utils";
+import {
+  AnalysisJobStateResponse,
+  AnalysisStageId,
+  ComprehensiveAnalysisResponse,
+  DictionaryDefinitionResponse,
+} from "./types";
+import {
+  ANALYSIS_STAGE_ORDER,
+  ANALYSIS_STAGES,
+  filterValidStageIds,
+  generateMarkdownReport,
+  pickSafePartialAnalysisData,
+  sanitizeAnalysisResponse,
+} from "./utils";
 import MarkdownViewerModal from "./components/MarkdownViewerModal";
 import { PWAInstallButton } from "./components/PWAInstallButton";
 import { OfflineIndicator } from "./components/OfflineIndicator";
@@ -79,6 +97,24 @@ const THEME_ICONS: Record<string, typeof Trees> = {
   midnight: Moon,
 };
 
+const ACTIVE_JOB_STORAGE_KEY = "sai_active_analysis_job";
+const ACTIVE_JOB_MAX_AGE_MS = 2 * 60 * 60 * 1000;
+
+interface PersistedAnalysisJob {
+  jobId: string;
+  topic: string;
+  focusType: string;
+  tradition: string;
+  executionMode: "background" | "step-by-step";
+  status: "running" | "paused_error" | "interrupted";
+  completedStages: AnalysisStageId[];
+  currentStage: AnalysisStageId | null;
+  failedStage?: AnalysisStageId | null;
+  partialData: Record<string, any>;
+  errorMessage?: string;
+  updatedAt: number;
+}
+
 type PresetFilterGroup = "Todas" | PresetTemplate["group"];
 
 export default function App() {
@@ -117,6 +153,9 @@ export default function App() {
   const [activeTradition, setActiveTradition] = useState<string>("General / Neutral (Sin Sesgo)");
   const [loading, setLoading] = useState(false);
   const [loadingPhase, setLoadingPhase] = useState("");
+  const [activeJob, setActiveJob] = useState<PersistedAnalysisJob | null>(null);
+  const [reconnecting, setReconnecting] = useState(false);
+  const [isPartialPreview, setIsPartialPreview] = useState(false);
   const [analysis, setAnalysis] = useState<ComprehensiveAnalysisResponse | null>(null);
   const [history, setHistory] = useState<HistoryEntry[]>([]);
   const [activeTab, setActiveTab] = useState<AnalysisTabId>("resumen");
@@ -126,6 +165,8 @@ export default function App() {
   const [historyOpen, setHistoryOpen] = useState(false);
   const [mdViewerOpen, setMdViewerOpen] = useState(false);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
+  const activeRunControllerRef = useRef<AbortController | null>(null);
+  const activeRunIdRef = useRef<number>(0);
 
   // Template Library filters & page shuffle
   const [presetGroup, setPresetGroup] = useState<PresetFilterGroup>("Todas");
@@ -388,11 +429,13 @@ export default function App() {
     }
   }, []);
 
-  const saveToHistory = (newItem: HistoryEntry) => {
-    const updated = [newItem, ...history.filter((h) => h.topic !== newItem.topic)].slice(0, 30);
-    setHistory(updated);
-    safeSetStorage("comprehensive_analysis_history", JSON.stringify(updated));
-  };
+  const saveToHistory = useCallback((newItem: HistoryEntry) => {
+    setHistory((prev) => {
+      const updated = [newItem, ...prev.filter((h) => h.topic !== newItem.topic)].slice(0, 30);
+      safeSetStorage("comprehensive_analysis_history", JSON.stringify(updated));
+      return updated;
+    });
+  }, []);
 
   const toggleFavorite = (id: string, e: React.MouseEvent) => {
     e.stopPropagation();
@@ -424,6 +467,401 @@ export default function App() {
     return () => clearInterval(interval);
   }, [loading]);
 
+  const persistActiveJob = useCallback((job: PersistedAnalysisJob | null) => {
+    setActiveJob(job);
+    if (!job) {
+      safeRemoveStorage(ACTIVE_JOB_STORAGE_KEY);
+      return;
+    }
+    safeSetStorage(ACTIVE_JOB_STORAGE_KEY, JSON.stringify(job));
+  }, []);
+
+  const completeAnalysisJob = useCallback(
+    (
+      rawFinal: any,
+      meta: { topic: string; focusType: string; tradition: string }
+    ) => {
+      const result: ComprehensiveAnalysisResponse = sanitizeAnalysisResponse(rawFinal);
+      setAnalysis(result);
+      setIsPartialPreview(false);
+      setActiveTradition(meta.tradition);
+      setActiveTab("resumen");
+      setMobileNavTab("resultados");
+      setErrorMsg(null);
+      setReconnecting(false);
+      setLoading(false);
+      persistActiveJob(null);
+
+      saveToHistory({
+        id: Date.now().toString(),
+        topic: meta.topic,
+        focusType: meta.focusType,
+        tradition: meta.tradition,
+        timestamp: new Date().toLocaleString("es-ES"),
+        data: result,
+      });
+
+      setTimeout(() => {
+        resultsSectionRef.current?.scrollIntoView({ behavior: "smooth", block: "start" });
+      }, 150);
+    },
+    [persistActiveJob, saveToHistory]
+  );
+
+  const pollBackgroundJobUntilDone = useCallback(
+    async (initialJob: PersistedAnalysisJob) => {
+      const runId = ++activeRunIdRef.current;
+      activeRunControllerRef.current?.abort();
+      const runController = new AbortController();
+      activeRunControllerRef.current = runController;
+
+      let latestJob = initialJob;
+      let consecutiveNetworkErrors = 0;
+
+      setLoading(true);
+      setErrorMsg(null);
+      setReconnecting(false);
+
+      while (!runController.signal.aborted && activeRunIdRef.current === runId) {
+        try {
+          const pollController = new AbortController();
+          const onRunAbort = () => pollController.abort();
+          runController.signal.addEventListener("abort", onRunAbort, { once: true });
+          const timer = setTimeout(() => pollController.abort(), 12000);
+
+          let pollRes: Response;
+          try {
+            pollRes = await fetch(`/api/analyze/jobs/${latestJob.jobId}`, {
+              method: "GET",
+              signal: pollController.signal,
+            });
+          } finally {
+            clearTimeout(timer);
+            runController.signal.removeEventListener("abort", onRunAbort);
+          }
+
+          if (pollRes.status === 404) {
+            // Server restarted and lost temp/RAM checkpoint — re-seed server cleanly with client partialData
+            const rehydrateRes = await fetch(`/api/analyze/jobs/${latestJob.jobId}/resume`, {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              signal: runController.signal,
+              body: JSON.stringify({
+                topic: latestJob.topic,
+                focusType: latestJob.focusType,
+                tradicionTeologica: latestJob.tradition,
+                completedStages: latestJob.completedStages,
+                partialData: latestJob.partialData,
+              }),
+            });
+            const rehydrated = await parseApiJsonResponse<AnalysisJobStateResponse>(
+              rehydrateRes,
+              "/api/analyze/jobs/resume"
+            );
+            consecutiveNetworkErrors = 0;
+            setReconnecting(false);
+
+            latestJob = {
+              jobId: rehydrated.jobId,
+              topic: rehydrated.topic || latestJob.topic,
+              focusType: rehydrated.focusType || latestJob.focusType,
+              tradition: rehydrated.tradicionTeologica || latestJob.tradition,
+              executionMode: rehydrated.executionMode,
+              status: rehydrated.status === "completed" ? "running" : rehydrated.status,
+              completedStages: filterValidStageIds(rehydrated.completedStages),
+              currentStage: rehydrated.currentStage,
+              failedStage: rehydrated.failedStage,
+              partialData: pickSafePartialAnalysisData(rehydrated.partialData),
+              errorMessage: rehydrated.error,
+              updatedAt: Date.now(),
+            };
+            persistActiveJob(latestJob);
+
+            if (rehydrated.status === "completed" && rehydrated.result) {
+              completeAnalysisJob(rehydrated.result, {
+                topic: latestJob.topic,
+                focusType: latestJob.focusType,
+                tradition: latestJob.tradition,
+              });
+              return;
+            }
+            if (rehydrated.executionMode === "step-by-step") {
+              break;
+            }
+            continue;
+          }
+
+          const state = await parseApiJsonResponse<AnalysisJobStateResponse>(
+            pollRes,
+            `/api/analyze/jobs/${latestJob.jobId}`
+          );
+
+          consecutiveNetworkErrors = 0;
+          setReconnecting(false);
+
+          const nextPersisted: PersistedAnalysisJob = {
+            jobId: state.jobId,
+            topic: state.topic || latestJob.topic,
+            focusType: state.focusType || latestJob.focusType,
+            tradition: state.tradicionTeologica || latestJob.tradition,
+            executionMode: state.executionMode,
+            status: state.status === "completed" ? "running" : state.status,
+            completedStages: filterValidStageIds(state.completedStages),
+            currentStage: state.currentStage,
+            failedStage: state.failedStage,
+            partialData:
+              Object.keys(state.partialData || {}).length >= Object.keys(latestJob.partialData || {}).length
+                ? pickSafePartialAnalysisData(state.partialData)
+                : latestJob.partialData,
+            errorMessage: state.error,
+            updatedAt: Date.now(),
+          };
+          latestJob = nextPersisted;
+
+          if (state.status === "completed" && state.result) {
+            completeAnalysisJob(state.result, {
+              topic: latestJob.topic,
+              focusType: latestJob.focusType,
+              tradition: latestJob.tradition,
+            });
+            return;
+          }
+
+          if (state.status === "paused_error") {
+            persistActiveJob(nextPersisted);
+            setErrorMsg(
+              state.error ||
+                "Se interrumpió una etapa en el servidor. Tu avance previo está guardado para continuar."
+            );
+            setLoading(false);
+            return;
+          }
+
+          persistActiveJob(nextPersisted);
+          await new Promise((resolve) => setTimeout(resolve, 1200));
+        } catch (err: any) {
+          if (runController.signal.aborted || activeRunIdRef.current !== runId) {
+            return;
+          }
+
+          consecutiveNetworkErrors += 1;
+          if (consecutiveNetworkErrors <= 12) {
+            setReconnecting(true);
+            const waitMs = Math.min(4000, 1200 + consecutiveNetworkErrors * 350);
+            await new Promise((resolve) => setTimeout(resolve, waitMs));
+            continue;
+          }
+
+          const interruptedJob: PersistedAnalysisJob = {
+            ...latestJob,
+            status: "interrupted",
+            errorMessage:
+              err?.message ||
+              "Se perdió temporalmente la conexión con el servidor. Tu progreso guardado permanece intacto.",
+            updatedAt: Date.now(),
+          };
+          persistActiveJob(interruptedJob);
+          setErrorMsg(interruptedJob.errorMessage || "Conexión interrumpida.");
+          setReconnecting(false);
+          setLoading(false);
+          return;
+        }
+      }
+    },
+    [completeAnalysisJob, persistActiveJob]
+  );
+
+  const runStepByStepStages = useCallback(
+    async (initialJob: PersistedAnalysisJob) => {
+      const runId = ++activeRunIdRef.current;
+      activeRunControllerRef.current?.abort();
+      const runController = new AbortController();
+      activeRunControllerRef.current = runController;
+
+      let latestJob = initialJob;
+      setLoading(true);
+      setErrorMsg(null);
+      setReconnecting(false);
+
+      const pendingStages = ANALYSIS_STAGE_ORDER.filter(
+        (stageId) => !latestJob.completedStages.includes(stageId)
+      );
+
+      for (const stageId of pendingStages) {
+        if (runController.signal.aborted || activeRunIdRef.current !== runId) return;
+
+        latestJob = {
+          ...latestJob,
+          status: "running",
+          currentStage: stageId,
+          failedStage: null,
+          errorMessage: undefined,
+          updatedAt: Date.now(),
+        };
+        persistActiveJob(latestJob);
+
+        let stageSucceeded = false;
+        let lastErr: any = null;
+
+        // Up to 2 automatic attempts per stage on transient network/503 glitches
+        for (let attempt = 1; attempt <= 2; attempt++) {
+          if (runController.signal.aborted || activeRunIdRef.current !== runId) return;
+          try {
+            const stageController = new AbortController();
+            const onAbort = () => stageController.abort();
+            runController.signal.addEventListener("abort", onAbort, { once: true });
+            const timer = setTimeout(() => stageController.abort(), 50000);
+
+            let res: Response;
+            try {
+              res = await fetch("/api/analyze/stage", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                signal: stageController.signal,
+                body: JSON.stringify({
+                  jobId: latestJob.jobId,
+                  stage: stageId,
+                  topic: latestJob.topic,
+                  focusType: latestJob.focusType,
+                  tradicionTeologica: latestJob.tradition,
+                  completedStages: latestJob.completedStages,
+                  partialData: latestJob.partialData,
+                }),
+              });
+            } finally {
+              clearTimeout(timer);
+              runController.signal.removeEventListener("abort", onAbort);
+            }
+
+            const state = await parseApiJsonResponse<AnalysisJobStateResponse>(
+              res,
+              "/api/analyze/stage"
+            );
+
+            setReconnecting(false);
+            latestJob = {
+              ...latestJob,
+              completedStages: filterValidStageIds(state.completedStages),
+              currentStage: state.currentStage,
+              partialData: pickSafePartialAnalysisData(state.partialData),
+              updatedAt: Date.now(),
+            };
+            persistActiveJob(latestJob);
+
+            if (state.status === "completed" && state.result) {
+              completeAnalysisJob(state.result, {
+                topic: latestJob.topic,
+                focusType: latestJob.focusType,
+                tradition: latestJob.tradition,
+              });
+              return;
+            }
+
+            stageSucceeded = true;
+            break;
+          } catch (err: any) {
+            if (runController.signal.aborted || activeRunIdRef.current !== runId) return;
+            lastErr = err;
+            if (attempt < 2) {
+              setReconnecting(true);
+              await new Promise((r) => setTimeout(r, 1400));
+            }
+          }
+        }
+
+        if (!stageSucceeded) {
+          const pausedJob: PersistedAnalysisJob = {
+            ...latestJob,
+            status: "paused_error",
+            failedStage: stageId,
+            errorMessage:
+              lastErr?.message ||
+              "Se interrumpió la conexión durante esta etapa. Puedes continuar exactamente desde aquí.",
+            updatedAt: Date.now(),
+          };
+          persistActiveJob(pausedJob);
+          setErrorMsg(pausedJob.errorMessage || "Etapa interrumpida.");
+          setReconnecting(false);
+          setLoading(false);
+          return;
+        }
+      }
+
+      if (latestJob.completedStages.length === ANALYSIS_STAGE_ORDER.length) {
+        completeAnalysisJob(latestJob.partialData, {
+          topic: latestJob.topic,
+          focusType: latestJob.focusType,
+          tradition: latestJob.tradition,
+        });
+      }
+    },
+    [completeAnalysisJob, persistActiveJob]
+  );
+
+  // Restore saved checkpointed job on initial mount & reconnect automatically if it was running
+  useEffect(() => {
+    const rawSaved = safeGetStorage(ACTIVE_JOB_STORAGE_KEY);
+    if (!rawSaved) return;
+    try {
+      const parsed = JSON.parse(rawSaved) as PersistedAnalysisJob;
+      if (!parsed || typeof parsed !== "object" || !parsed.jobId || !parsed.topic) {
+        safeRemoveStorage(ACTIVE_JOB_STORAGE_KEY);
+        return;
+      }
+      if (Date.now() - (parsed.updatedAt || 0) > ACTIVE_JOB_MAX_AGE_MS) {
+        safeRemoveStorage(ACTIVE_JOB_STORAGE_KEY);
+        return;
+      }
+
+      const hydrated: PersistedAnalysisJob = {
+        ...parsed,
+        completedStages: filterValidStageIds(parsed.completedStages),
+        partialData: pickSafePartialAnalysisData(parsed.partialData),
+      };
+
+      setTopic(hydrated.topic);
+      if (hydrated.focusType && !hydrated.focusType.startsWith("Solicitud Manual:")) {
+        setFocusType(hydrated.focusType);
+      }
+      if (hydrated.tradition) {
+        setTradicionTeologica(hydrated.tradition);
+      }
+
+      if (hydrated.status === "running" && hydrated.executionMode === "background") {
+        setActiveJob(hydrated);
+        setMobileNavTab("resultados");
+        void pollBackgroundJobUntilDone(hydrated);
+      } else {
+        const pausedOrInterrupted: PersistedAnalysisJob = {
+          ...hydrated,
+          status: hydrated.status === "running" ? "interrupted" : hydrated.status,
+          errorMessage:
+            hydrated.errorMessage ||
+            `Análisis en pausa (${hydrated.completedStages.length}/${ANALYSIS_STAGE_ORDER.length} etapas guardadas).`,
+        };
+        persistActiveJob(pausedOrInterrupted);
+      }
+    } catch {
+      safeRemoveStorage(ACTIVE_JOB_STORAGE_KEY);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // Re-sync when mobile device wakes or network reconnects while a job is active
+  useEffect(() => {
+    const handleVisibilityOrOnline = () => {
+      if (document.visibilityState === "visible" && loading && activeJob?.executionMode === "background") {
+        setReconnecting(false);
+      }
+    };
+    document.addEventListener("visibilitychange", handleVisibilityOrOnline);
+    window.addEventListener("online", handleVisibilityOrOnline);
+    return () => {
+      document.removeEventListener("visibilitychange", handleVisibilityOrOnline);
+      window.removeEventListener("online", handleVisibilityOrOnline);
+    };
+  }, [loading, activeJob]);
+
   const handleAnalyze = async (textToAnalyze?: string, selectedFocus?: string, selectedTradition?: string) => {
     const queryText = textToAnalyze || topic;
     let queryFocus = selectedFocus || focusType;
@@ -439,66 +877,199 @@ export default function App() {
     setLoading(true);
     setErrorMsg(null);
     setAnalysis(null);
+    setIsPartialPreview(false);
+    setReconnecting(false);
     setHistoryOpen(false);
     setMobileNavTab("resultados");
 
-    const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), 95000);
+    const initController = new AbortController();
+    const initTimer = setTimeout(() => initController.abort(), 20000);
 
     try {
-      const response = await fetch("/api/analyze", {
+      const response = await fetch("/api/analyze/jobs", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        signal: controller.signal,
+        signal: initController.signal,
         body: JSON.stringify({
           topic: queryText,
           focusType: queryFocus,
           tradicionTeologica: queryTradition,
         }),
       });
+      clearTimeout(initTimer);
 
-      clearTimeout(timeoutId);
+      const jobState = await parseApiJsonResponse<AnalysisJobStateResponse>(
+        response,
+        "/api/analyze/jobs"
+      );
 
-      const rawResult = await parseApiJsonResponse<any>(response, "/api/analyze");
-      const result: ComprehensiveAnalysisResponse = sanitizeAnalysisResponse(rawResult);
-      setAnalysis(result);
-      setActiveTradition(queryTradition);
-      setActiveTab("resumen");
-      setMobileNavTab("resultados");
+      if (jobState.status === "completed" && jobState.result) {
+        completeAnalysisJob(jobState.result, {
+          topic: queryText,
+          focusType: queryFocus,
+          tradition: queryTradition,
+        });
+        return;
+      }
 
-      saveToHistory({
-        id: Date.now().toString(),
+      const initialJob: PersistedAnalysisJob = {
+        jobId: jobState.jobId,
         topic: queryText,
         focusType: queryFocus,
         tradition: queryTradition,
-        timestamp: new Date().toLocaleString("es-ES"),
-        data: result,
-      });
+        executionMode: jobState.executionMode,
+        status: "running",
+        completedStages: filterValidStageIds(jobState.completedStages),
+        currentStage: jobState.currentStage || "base",
+        partialData: pickSafePartialAnalysisData(jobState.partialData),
+        updatedAt: Date.now(),
+      };
+      persistActiveJob(initialJob);
 
-      setTimeout(() => {
-        resultsSectionRef.current?.scrollIntoView({ behavior: "smooth", block: "start" });
-      }, 150);
+      if (jobState.executionMode === "step-by-step") {
+        await runStepByStepStages(initialJob);
+      } else {
+        await pollBackgroundJobUntilDone(initialJob);
+      }
     } catch (error: any) {
-      clearTimeout(timeoutId);
+      clearTimeout(initTimer);
       console.warn("[Motor IA Aviso]:", error?.message || error);
       const rawMsg = error?.message || "";
-      if (
+      const friendlyMsg =
         error?.name === "AbortError" ||
         rawMsg.includes("Failed to fetch") ||
         rawMsg.includes("NetworkError") ||
         rawMsg.includes("Load failed")
-      ) {
-        setErrorMsg("La conexión con el motor de análisis tardó más de lo previsto o hubo una intermitencia de red. Pulsa 'Reintentar ahora'.");
-      } else if (rawMsg.includes("503") || rawMsg.includes("high demand") || rawMsg.includes("UNAVAILABLE") || rawMsg.includes("alta demanda")) {
-        setErrorMsg("El servidor de análisis está experimentando alta demanda temporal (503). Espera un instante y pulsa 'Reintentar ahora'.");
-      } else {
-        setErrorMsg(rawMsg || "Error de comunicación con el motor IA. Pulsa 'Reintentar ahora'.");
-      }
+          ? "No se pudo iniciar la sesión con el servidor por intermitencia de red. Pulsa 'Reintentar ahora'."
+          : rawMsg || "Error al iniciar el análisis. Pulsa 'Reintentar ahora'.";
+      setErrorMsg(friendlyMsg);
+      setLoading(false);
       setMobileNavTab("analizar");
-    } finally {
-      clearTimeout(timeoutId);
+    }
+  };
+
+  const handleResumeSavedJob = async (jobOverride?: PersistedAnalysisJob) => {
+    const jobToResume = jobOverride || activeJob;
+    if (!jobToResume || loading) return;
+
+    setTopic(jobToResume.topic);
+    if (jobToResume.tradition) setTradicionTeologica(jobToResume.tradition);
+    setAnalysis(null);
+    setIsPartialPreview(false);
+    setErrorMsg(null);
+    setLoading(true);
+    setReconnecting(false);
+    setHistoryOpen(false);
+    setMobileNavTab("resultados");
+
+    if (jobToResume.executionMode === "step-by-step") {
+      await runStepByStepStages(jobToResume);
+      return;
+    }
+
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 20000);
+    try {
+      const res = await fetch(`/api/analyze/jobs/${jobToResume.jobId}/resume`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        signal: controller.signal,
+        body: JSON.stringify({
+          topic: jobToResume.topic,
+          focusType: jobToResume.focusType,
+          tradicionTeologica: jobToResume.tradition,
+          completedStages: jobToResume.completedStages,
+          partialData: jobToResume.partialData,
+        }),
+      });
+      clearTimeout(timer);
+
+      const resumed = await parseApiJsonResponse<AnalysisJobStateResponse>(
+        res,
+        `/api/analyze/jobs/${jobToResume.jobId}/resume`
+      );
+
+      if (resumed.status === "completed" && resumed.result) {
+        completeAnalysisJob(resumed.result, {
+          topic: jobToResume.topic,
+          focusType: jobToResume.focusType,
+          tradition: jobToResume.tradition,
+        });
+        return;
+      }
+
+      const nextJob: PersistedAnalysisJob = {
+        jobId: resumed.jobId,
+        topic: resumed.topic || jobToResume.topic,
+        focusType: resumed.focusType || jobToResume.focusType,
+        tradition: resumed.tradicionTeologica || jobToResume.tradition,
+        executionMode: resumed.executionMode,
+        status: "running",
+        completedStages: filterValidStageIds(resumed.completedStages),
+        currentStage: resumed.currentStage,
+        partialData: pickSafePartialAnalysisData(resumed.partialData),
+        updatedAt: Date.now(),
+      };
+      persistActiveJob(nextJob);
+
+      if (resumed.executionMode === "step-by-step") {
+        await runStepByStepStages(nextJob);
+      } else {
+        await pollBackgroundJobUntilDone(nextJob);
+      }
+    } catch (error: any) {
+      clearTimeout(timer);
+      const nextPaused: PersistedAnalysisJob = {
+        ...jobToResume,
+        status: "interrupted",
+        errorMessage:
+          error?.message ||
+          "No se pudo reconectar con el servidor todavía. Tu avance sigue guardado.",
+        updatedAt: Date.now(),
+      };
+      persistActiveJob(nextPaused);
+      setErrorMsg(nextPaused.errorMessage || "Error al reanudar.");
       setLoading(false);
     }
+  };
+
+  const handlePauseCurrentJob = () => {
+    activeRunIdRef.current += 1;
+    activeRunControllerRef.current?.abort();
+    setLoading(false);
+    setReconnecting(false);
+    if (activeJob) {
+      const paused: PersistedAnalysisJob = {
+        ...activeJob,
+        status: "interrupted",
+        errorMessage: `Análisis pausado manualmente (${activeJob.completedStages.length}/${ANALYSIS_STAGE_ORDER.length} etapas guardadas).`,
+        updatedAt: Date.now(),
+      };
+      persistActiveJob(paused);
+    }
+  };
+
+  const handleDiscardSavedJob = () => {
+    activeRunIdRef.current += 1;
+    activeRunControllerRef.current?.abort();
+    setLoading(false);
+    setReconnecting(false);
+    setErrorMsg(null);
+    persistActiveJob(null);
+  };
+
+  const handleViewPartialProgress = () => {
+    if (!activeJob || activeJob.completedStages.length === 0) return;
+    activeRunIdRef.current += 1;
+    activeRunControllerRef.current?.abort();
+    setLoading(false);
+    setReconnecting(false);
+    const partialSanitized = sanitizeAnalysisResponse(activeJob.partialData);
+    setAnalysis(partialSanitized);
+    setIsPartialPreview(true);
+    setActiveTradition(activeJob.tradition || tradicionTeologica);
+    setActiveTab("resumen");
+    setMobileNavTab("resultados");
   };
 
   const handleCopyMarkdown = () => {
@@ -525,6 +1096,7 @@ export default function App() {
 
   const handleNewQuery = () => {
     setAnalysis(null);
+    setIsPartialPreview(false);
     setErrorMsg(null);
     setHistoryOpen(false);
     setMobileNavTab("analizar");
@@ -829,6 +1401,8 @@ export default function App() {
                 history={history}
                 onSelect={(entry) => {
                   setAnalysis(entry.data);
+                  setIsPartialPreview(false);
+                  setErrorMsg(null);
                   setTopic(entry.topic);
                   setFocusType(entry.focusType);
                   if (entry.tradition) {
@@ -1043,24 +1617,71 @@ export default function App() {
               </button>
             </div>
 
-            {errorMsg && (
-              <div className="bg-sem-amber-bg border border-sem-amber-border p-4 rounded-xl text-xs flex flex-col sm:flex-row items-start sm:items-center justify-between gap-3">
-                <div className="flex items-start gap-2.5">
+            {(errorMsg || (activeJob && !loading && activeJob.completedStages.length < ANALYSIS_STAGE_ORDER.length)) && (
+              <div className="bg-sem-amber-bg border border-sem-amber-border p-4 rounded-xl text-xs flex flex-col gap-3">
+                <div className="flex items-start gap-2.5 min-w-0">
                   <AlertTriangle className="w-4 h-4 shrink-0 text-sem-amber mt-0.5" />
-                  <div>
-                    <span className="font-bold text-sem-amber">Aviso del Sistema: </span>
-                    <span className="text-brand-text">{errorMsg}</span>
+                  <div className="min-w-0 space-y-1">
+                    <div className="font-bold text-sem-amber">
+                      {activeJob
+                        ? `Progreso guardado (${activeJob.completedStages.length}/${ANALYSIS_STAGE_ORDER.length} etapas completadas)`
+                        : "Aviso del Sistema"}
+                    </div>
+                    <p className="text-brand-text break-words">
+                      {errorMsg ||
+                        activeJob?.errorMessage ||
+                        "El análisis quedó en pausa. Puedes reanudarlo exactamente donde se quedó."}
+                    </p>
                   </div>
                 </div>
-                <button
-                  type="button"
-                  onClick={() => handleAnalyze()}
-                  disabled={loading}
-                  className="shrink-0 flex items-center gap-1.5 px-3.5 py-2 bg-brand-gold text-slate-950 hover:bg-brand-gold-hover font-bold text-xs rounded-lg transition cursor-pointer disabled:opacity-50"
-                >
-                  <RefreshCw className="w-3.5 h-3.5" />
-                  <span>Reintentar ahora</span>
-                </button>
+
+                <div className="flex flex-wrap items-center gap-2">
+                  {activeJob ? (
+                    <>
+                      <button
+                        type="button"
+                        onClick={() => handleResumeSavedJob(activeJob)}
+                        disabled={loading}
+                        className="flex items-center gap-1.5 px-3.5 py-2 bg-brand-gold text-slate-950 hover:bg-brand-gold-hover font-bold text-xs rounded-lg transition cursor-pointer disabled:opacity-50"
+                      >
+                        <Play className="w-3.5 h-3.5" />
+                        <span>
+                          Continuar donde se quedó (Etapa{" "}
+                          {Math.min(activeJob.completedStages.length + 1, ANALYSIS_STAGE_ORDER.length)}/
+                          {ANALYSIS_STAGE_ORDER.length})
+                        </span>
+                      </button>
+                      {activeJob.completedStages.length > 0 && (
+                        <button
+                          type="button"
+                          onClick={handleViewPartialProgress}
+                          className="flex items-center gap-1.5 px-3 py-2 bg-brand-card border border-brand-border hover:border-brand-gold/50 text-brand-text font-semibold text-xs rounded-lg transition cursor-pointer"
+                        >
+                          <Eye className="w-3.5 h-3.5 text-brand-gold" />
+                          <span>Ver avance parcial</span>
+                        </button>
+                      )}
+                      <button
+                        type="button"
+                        onClick={handleDiscardSavedJob}
+                        className="flex items-center gap-1.5 px-3 py-2 bg-brand-bg border border-brand-border hover:text-sem-rose text-brand-text-muted font-semibold text-xs rounded-lg transition cursor-pointer"
+                      >
+                        <X className="w-3.5 h-3.5" />
+                        <span>Descartar</span>
+                      </button>
+                    </>
+                  ) : (
+                    <button
+                      type="button"
+                      onClick={() => handleAnalyze()}
+                      disabled={loading}
+                      className="flex items-center gap-1.5 px-3.5 py-2 bg-brand-gold text-slate-950 hover:bg-brand-gold-hover font-bold text-xs rounded-lg transition cursor-pointer disabled:opacity-50"
+                    >
+                      <RefreshCw className="w-3.5 h-3.5" />
+                      <span>Reintentar ahora</span>
+                    </button>
+                  )}
+                </div>
               </div>
             )}
           </div>
@@ -1154,39 +1775,166 @@ export default function App() {
           </div>
         </section>
 
-        {/* Loading State */}
+        {/* Checkpointed Stage Loading State */}
         {loading && (
           <section
             className={`${
               mobileNavTab === "resultados" ? "flex" : "hidden md:flex"
-            } bg-brand-card rounded-2xl border border-brand-border p-8 sm:p-12 flex-col items-center justify-center gap-6 min-h-[340px]`}
+            } bg-brand-card rounded-2xl border border-brand-border p-5 sm:p-8 flex-col gap-5`}
           >
-            <div className="relative flex items-center justify-center">
-              <div className="w-14 h-14 rounded-full border-2 border-brand-border border-t-brand-gold animate-spin" />
-              <Brain className="w-6 h-6 text-brand-gold absolute" />
+            <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 border-b border-brand-border pb-4">
+              <div className="flex items-center gap-3.5 min-w-0">
+                <div className="relative flex items-center justify-center shrink-0">
+                  <div className="w-11 h-11 rounded-full border-2 border-brand-border border-t-brand-gold animate-spin" />
+                  <Brain className="w-5 h-5 text-brand-gold absolute" />
+                </div>
+                <div className="min-w-0 space-y-1">
+                  <h3 className="text-sm sm:text-base font-bold text-brand-text font-serif">
+                    Construyendo Reporte por Etapas Verificadas
+                  </h3>
+                  <p className="text-xs text-brand-gold font-mono tracking-wide truncate">
+                    {reconnecting
+                      ? "Reconectando con el servidor sin perder avance..."
+                      : activeJob?.currentStage
+                      ? `Etapa ${Math.min((activeJob.completedStages.length || 0) + 1, ANALYSIS_STAGE_ORDER.length)}/${ANALYSIS_STAGE_ORDER.length}: ${
+                          ANALYSIS_STAGES.find((s) => s.id === activeJob.currentStage)?.title || loadingPhase
+                        }`
+                      : loadingPhase}
+                  </p>
+                </div>
+              </div>
+
+              <div className="flex flex-wrap items-center gap-2 shrink-0">
+                {activeJob && activeJob.completedStages.length > 0 && (
+                  <button
+                    type="button"
+                    onClick={handleViewPartialProgress}
+                    className="px-3 py-1.5 rounded-lg bg-brand-bg border border-brand-border hover:border-brand-gold/50 text-xs font-semibold text-brand-text flex items-center gap-1.5 transition cursor-pointer"
+                  >
+                    <Eye className="w-3.5 h-3.5 text-brand-gold" />
+                    <span>Ver avance ({activeJob.completedStages.length}/4)</span>
+                  </button>
+                )}
+                <button
+                  type="button"
+                  onClick={handlePauseCurrentJob}
+                  className="px-3 py-1.5 rounded-lg bg-brand-bg border border-brand-border hover:border-brand-gold/50 text-xs font-semibold text-brand-text-muted hover:text-brand-text flex items-center gap-1.5 transition cursor-pointer"
+                >
+                  <PauseCircle className="w-3.5 h-3.5 text-brand-gold" />
+                  <span>Pausar</span>
+                </button>
+              </div>
             </div>
 
-            <div className="text-center max-w-lg space-y-2">
-              <h3 className="text-base font-bold text-brand-text font-serif">
-                Construyendo Reporte Multidisciplinario y Auditoría
-              </h3>
-              <p className="text-xs text-brand-gold font-mono tracking-wide">
-                {loadingPhase}
-              </p>
+            {reconnecting && (
+              <div className="bg-sem-amber-bg border border-sem-amber-border rounded-xl px-3.5 py-2.5 text-xs text-sem-amber flex items-center gap-2">
+                <WifiOff className="w-4 h-4 shrink-0" />
+                <span>
+                  Intermitencia detectada. Reintentando enlace automáticamente — tu progreso completado sigue seguro.
+                </span>
+              </div>
+            )}
+
+            {/* Progress Bar */}
+            <div className="space-y-1.5">
+              <div className="flex items-center justify-between text-xs">
+                <span className="text-brand-text-muted font-medium">
+                  Avance guardado en servidor y dispositivo
+                </span>
+                <span className="font-mono font-bold text-brand-gold tabular-nums">
+                  {Math.round(((activeJob?.completedStages.length || 0) / ANALYSIS_STAGE_ORDER.length) * 100)}%
+                </span>
+              </div>
+              <div className="h-2.5 w-full rounded-full bg-brand-bg border border-brand-border overflow-hidden">
+                <div
+                  className="h-full bg-brand-gold transition-all duration-500"
+                  style={{
+                    width: `${Math.max(
+                      8,
+                      Math.round(((activeJob?.completedStages.length || 0) / ANALYSIS_STAGE_ORDER.length) * 100)
+                    )}%`,
+                  }}
+                />
+              </div>
             </div>
 
-            <div className="border-t border-brand-border pt-4 text-center max-w-lg text-xs text-brand-text-muted font-serif italic">
-              Se están generando definiciones duales, contraste de perspectivas, matriz de decisiones, plan de riesgos, auditoría de sesgos, test diagnóstico y enlaces verificados.
+            {/* 4-Stage Checkpoint Cards */}
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+              {ANALYSIS_STAGES.map((stage) => {
+                const isDone = activeJob?.completedStages.includes(stage.id);
+                const isCurrent = !isDone && activeJob?.currentStage === stage.id;
+                return (
+                  <div
+                    key={stage.id}
+                    className={`p-3.5 rounded-xl border transition flex items-start gap-3 min-w-0 ${
+                      isDone
+                        ? "bg-sem-emerald-bg/40 border-sem-emerald-border"
+                        : isCurrent
+                        ? "bg-brand-gold/10 border-brand-gold/60"
+                        : "bg-brand-bg/50 border-brand-border/70 opacity-70"
+                    }`}
+                  >
+                    <div className="mt-0.5 shrink-0">
+                      {isDone ? (
+                        <CheckCircle2 className="w-4 h-4 text-sem-emerald" />
+                      ) : isCurrent ? (
+                        <RefreshCw className="w-4 h-4 text-brand-gold animate-spin" />
+                      ) : (
+                        <Clock className="w-4 h-4 text-brand-text-muted" />
+                      )}
+                    </div>
+                    <div className="min-w-0 space-y-0.5">
+                      <div className="flex items-center gap-2 text-xs font-bold text-brand-text">
+                        <span className="font-mono text-brand-gold">0{stage.order}</span>
+                        <span className="truncate">{stage.title}</span>
+                      </div>
+                      <p className="text-[11px] text-brand-text-muted leading-snug break-words">
+                        {stage.subtitle}
+                      </p>
+                    </div>
+                  </div>
+                );
+              })}
             </div>
+
+            <p className="text-xs text-brand-text-muted font-serif italic text-center border-t border-brand-border pt-3">
+              Si la red cae o recargas la página, el motor retomará exactamente desde la última etapa sin completar.
+            </p>
           </section>
         )}
 
-        {/* Analysis Workspace */}
+        {/* Analysis Workspace (Full or Partial Preview with Resume Banner) */}
         {analysis && !loading && (
           <section
             ref={resultsSectionRef}
-            className={mobileNavTab === "resultados" ? "block" : "hidden md:block"}
+            className={`${mobileNavTab === "resultados" ? "block" : "hidden md:block"} space-y-4`}
           >
+            {isPartialPreview && activeJob && activeJob.completedStages.length < ANALYSIS_STAGE_ORDER.length && (
+              <div className="bg-sem-amber-bg border border-sem-amber-border rounded-2xl p-4 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+                <div className="flex items-start gap-2.5 min-w-0">
+                  <AlertTriangle className="w-4 h-4 text-sem-amber shrink-0 mt-0.5" />
+                  <div className="text-xs min-w-0">
+                    <span className="font-bold text-sem-amber block">
+                      Vista de avance parcial ({activeJob.completedStages.length}/{ANALYSIS_STAGE_ORDER.length} etapas)
+                    </span>
+                    <span className="text-brand-text">
+                      Las secciones restantes aún no se han completado. Puedes continuar ahora desde donde se quedó.
+                    </span>
+                  </div>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => handleResumeSavedJob(activeJob)}
+                  className="shrink-0 px-4 py-2 rounded-xl bg-brand-gold hover:bg-brand-gold-hover text-slate-950 font-bold text-xs flex items-center gap-1.5 transition cursor-pointer"
+                >
+                  <Play className="w-3.5 h-3.5" />
+                  <span>
+                    Completar análisis ({activeJob.completedStages.length}/{ANALYSIS_STAGE_ORDER.length})
+                  </span>
+                </button>
+              </div>
+            )}
+
             <AnalysisWorkspace
               analysis={analysis}
               topic={topic}
@@ -1203,6 +1951,50 @@ export default function App() {
               analysisContainerRef={analysisContainerRef}
               onTextSelection={handleTextSelection}
             />
+          </section>
+        )}
+
+        {/* Mobile-visible recovery notice when on Resultados tab without analysis (e.g. paused/error) */}
+        {!analysis && !loading && activeJob && mobileNavTab === "resultados" && (
+          <section className="md:hidden bg-brand-card border border-brand-border rounded-2xl p-5 space-y-4">
+            <div className="flex items-start gap-3">
+              <AlertTriangle className="w-5 h-5 text-sem-amber shrink-0 mt-0.5" />
+              <div className="min-w-0 space-y-1">
+                <h3 className="text-sm font-bold text-brand-text font-serif">
+                  Análisis interrumpido ({activeJob.completedStages.length}/{ANALYSIS_STAGE_ORDER.length} etapas guardadas)
+                </h3>
+                <p className="text-xs text-brand-text-muted break-words">
+                  {activeJob.errorMessage || "Puedes continuar exactamente desde la etapa pendiente sin perder lo ya generado."}
+                </p>
+              </div>
+            </div>
+            <div className="flex flex-wrap gap-2">
+              <button
+                type="button"
+                onClick={() => handleResumeSavedJob(activeJob)}
+                className="flex-1 min-h-[42px] px-4 py-2 rounded-xl bg-brand-gold text-slate-950 font-bold text-xs flex items-center justify-center gap-1.5 cursor-pointer"
+              >
+                <Play className="w-3.5 h-3.5" />
+                <span>Continuar donde se quedó</span>
+              </button>
+              {activeJob.completedStages.length > 0 && (
+                <button
+                  type="button"
+                  onClick={handleViewPartialProgress}
+                  className="min-h-[42px] px-3.5 py-2 rounded-xl bg-brand-bg border border-brand-border text-brand-text font-semibold text-xs flex items-center gap-1.5 cursor-pointer"
+                >
+                  <Eye className="w-3.5 h-3.5 text-brand-gold" />
+                  <span>Ver parcial</span>
+                </button>
+              )}
+              <button
+                type="button"
+                onClick={handleDiscardSavedJob}
+                className="min-h-[42px] px-3.5 py-2 rounded-xl bg-brand-bg border border-brand-border text-brand-text-muted font-semibold text-xs cursor-pointer"
+              >
+                Descartar
+              </button>
+            </div>
           </section>
         )}
 
@@ -1293,6 +2085,8 @@ export default function App() {
                       key={h.id}
                       onClick={() => {
                         setAnalysis(h.data);
+                        setIsPartialPreview(false);
+                        setErrorMsg(null);
                         setTopic(h.topic);
                         setFocusType(h.focusType);
                         if (h.tradition) {
@@ -1360,7 +2154,7 @@ export default function App() {
         aria-label="Navegación principal móvil"
         className="md:hidden fixed bottom-0 left-0 right-0 z-40 bg-brand-card/95 backdrop-blur-lg border-t border-brand-border pb-safe shadow-2xl no-print"
       >
-        <div className={`grid ${analysis || loading ? "grid-cols-5" : "grid-cols-4"} gap-1 px-1.5 py-1`}>
+        <div className={`grid ${analysis || loading || activeJob ? "grid-cols-5" : "grid-cols-4"} gap-1 px-1.5 py-1`}>
           <button
             type="button"
             onClick={() => {
@@ -1378,7 +2172,7 @@ export default function App() {
             <span className="truncate max-w-full">Consulta</span>
           </button>
 
-          {(analysis || loading) && (
+          {(analysis || loading || activeJob) && (
             <button
               type="button"
               onClick={() => {

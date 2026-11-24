@@ -1,13 +1,180 @@
 import express, { Request, Response, NextFunction } from "express";
+import crypto from "crypto";
+import fs from "fs";
+import os from "os";
+import path from "path";
 import { GoogleGenAI, ThinkingLevel } from "@google/genai";
 import dotenv from "dotenv";
-import { normalizeSafeHttpUrl, sanitizeAnalysisResponse } from "../src/utils.js";
-import { RecommendedResources, ResourceItem } from "../src/types.js";
+import {
+  ANALYSIS_STAGE_ORDER,
+  filterValidStageIds,
+  normalizeSafeHttpUrl,
+  pickSafePartialAnalysisData,
+  sanitizeAnalysisResponse,
+  sanitizeResourceList,
+} from "../src/utils.js";
+import {
+  AnalysisJobStateResponse,
+  AnalysisStageId,
+  ComprehensiveAnalysisResponse,
+  RecommendedResources,
+  ResourceItem,
+} from "../src/types.js";
 
 dotenv.config();
 
-// In-memory rate limiter (effective per instance & warm serverless container)
-const apiRequests = new Map<string, { count: number; resetAt: number }>();
+// In-memory rate limiters (effective per instance & warm serverless container)
+const apiMutationRequests = new Map<string, { count: number; resetAt: number }>();
+const apiPollRequests = new Map<string, { count: number; resetAt: number }>();
+
+const JOB_TTL_MS = 2 * 60 * 60 * 1000; // 2 hours
+const MAX_IN_MEMORY_JOBS = 100;
+const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const JOB_CACHE_DIR = path.resolve(os.tmpdir(), "analisispro-jobs");
+
+interface AnalysisJobRecord {
+  jobId: string;
+  status: "running" | "completed" | "paused_error";
+  topic: string;
+  focusType: string;
+  tradicionTeologica: string;
+  completedStages: AnalysisStageId[];
+  currentStage: AnalysisStageId | null;
+  failedStage: AnalysisStageId | null;
+  partialData: Record<string, any>;
+  result?: ComprehensiveAnalysisResponse;
+  error?: string;
+  retryable?: boolean;
+  createdAt: number;
+  updatedAt: number;
+}
+
+const jobsMap = new Map<string, AnalysisJobRecord>();
+const activeJobRunners = new Set<string>();
+
+function isValidUuid(id: unknown): id is string {
+  return typeof id === "string" && UUID_REGEX.test(id);
+}
+
+function getSafeJobCachePath(jobId: string): string | null {
+  if (!isValidUuid(jobId)) return null;
+  const resolved = path.resolve(JOB_CACHE_DIR, `${jobId}.json`);
+  if (!resolved.startsWith(JOB_CACHE_DIR + path.sep)) {
+    return null;
+  }
+  return resolved;
+}
+
+function persistJobCheckpoint(job: AnalysisJobRecord): void {
+  // Evict expired or excess entries in memory
+  const now = Date.now();
+  for (const [key, entry] of jobsMap.entries()) {
+    if (now - entry.updatedAt > JOB_TTL_MS && !activeJobRunners.has(key)) {
+      jobsMap.delete(key);
+    }
+  }
+  while (jobsMap.size >= MAX_IN_MEMORY_JOBS && !jobsMap.has(job.jobId)) {
+    const oldestKey = jobsMap.keys().next().value;
+    if (!oldestKey) break;
+    jobsMap.delete(oldestKey);
+  }
+  jobsMap.set(job.jobId, job);
+
+  // Best-effort checkpoint on tmp disk so restarts/reloads can recover seamlessly
+  const filePath = getSafeJobCachePath(job.jobId);
+  if (!filePath) return;
+  try {
+    fs.mkdirSync(JOB_CACHE_DIR, { recursive: true });
+    fs.writeFileSync(filePath, JSON.stringify(job), "utf8");
+  } catch {
+    // Read-only filesystem (e.g. some serverless sandboxes) — memory store + client checkpoint still work
+  }
+}
+
+function loadJobCheckpoint(jobId: string): AnalysisJobRecord | null {
+  if (!isValidUuid(jobId)) return null;
+  const now = Date.now();
+  const mem = jobsMap.get(jobId);
+  if (mem) {
+    if (now - mem.updatedAt <= JOB_TTL_MS || activeJobRunners.has(jobId)) {
+      return mem;
+    }
+    jobsMap.delete(jobId);
+  }
+
+  const filePath = getSafeJobCachePath(jobId);
+  if (!filePath) return null;
+  try {
+    if (!fs.existsSync(filePath)) return null;
+    const raw = fs.readFileSync(filePath, "utf8");
+    const parsed = JSON.parse(raw) as AnalysisJobRecord;
+    if (!parsed || typeof parsed !== "object" || parsed.jobId !== jobId) return null;
+    if (now - (parsed.updatedAt || 0) > JOB_TTL_MS) {
+      try {
+        fs.unlinkSync(filePath);
+      } catch {
+        // ignore
+      }
+      return null;
+    }
+    // If process died while status was "running" and no active runner exists in this new process,
+    // downgrade to paused_error so client/resume can cleanly continue from last completed stage.
+    if (parsed.status === "running" && !activeJobRunners.has(jobId)) {
+      parsed.status = "paused_error";
+      parsed.error =
+        "El servidor se reinició durante la generación, pero tu progreso previo se conservó. Pulsa 'Continuar donde se quedó'.";
+      parsed.retryable = true;
+    }
+    parsed.completedStages = filterValidStageIds(parsed.completedStages);
+    parsed.partialData = pickSafePartialAnalysisData(parsed.partialData);
+    jobsMap.set(jobId, parsed);
+    return parsed;
+  } catch {
+    return null;
+  }
+}
+
+function getNextPendingStage(completedStages: AnalysisStageId[]): AnalysisStageId | null {
+  for (const stage of ANALYSIS_STAGE_ORDER) {
+    if (!completedStages.includes(stage)) {
+      return stage;
+    }
+  }
+  return null;
+}
+
+function getExecutionMode(): "background" | "step-by-step" {
+  // Vercel serverless freezes background tasks after HTTP response returns; step-by-step avoids premature freezes
+  return process.env.VERCEL === "1" ? "step-by-step" : "background";
+}
+
+function serializeJobState(job: AnalysisJobRecord): AnalysisJobStateResponse {
+  const completedCount = job.completedStages.length;
+  const totalStages = ANALYSIS_STAGE_ORDER.length;
+  const progressPct =
+    job.status === "completed"
+      ? 100
+      : Math.min(95, Math.round((completedCount / totalStages) * 100));
+
+  return {
+    jobId: job.jobId,
+    status: job.status,
+    executionMode: getExecutionMode(),
+    topic: job.topic,
+    focusType: job.focusType,
+    tradicionTeologica: job.tradicionTeologica,
+    completedStages: job.completedStages,
+    currentStage: job.currentStage,
+    failedStage: job.failedStage,
+    totalStages,
+    progressPct,
+    partialData: job.partialData,
+    ...(job.result ? { result: job.result } : {}),
+    ...(job.error ? { error: job.error } : {}),
+    ...(job.retryable !== undefined ? { retryable: job.retryable } : {}),
+    updatedAt: job.updatedAt,
+  };
+}
 
 function getClientIp(req: Request): string {
   const fwd = req.headers["x-forwarded-for"];
@@ -42,6 +209,41 @@ function getGeminiClient(): GoogleGenAI {
   return aiClient;
 }
 
+function safeParseModelJson(rawText: string): Record<string, any> | null {
+  if (!rawText || typeof rawText !== "string") return null;
+  let text = rawText.trim();
+  if (text.startsWith("```")) {
+    text = text.replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/, "").trim();
+  }
+
+  const tryParse = (candidate: string): Record<string, any> | null => {
+    try {
+      const parsed = JSON.parse(candidate);
+      return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed : null;
+    } catch {
+      return null;
+    }
+  };
+
+  let parsed = tryParse(text);
+  if (parsed) return parsed;
+
+  const firstBrace = text.indexOf("{");
+  const lastBrace = text.lastIndexOf("}");
+  if (firstBrace !== -1 && lastBrace > firstBrace) {
+    const sliced = text.slice(firstBrace, lastBrace + 1);
+    parsed = tryParse(sliced);
+    if (parsed) return parsed;
+
+    // Strip common trailing commas before closing } or ]
+    const cleanedTrailingCommas = sliced.replace(/,\s*([}\]])/g, "$1");
+    parsed = tryParse(cleanedTrailingCommas);
+    if (parsed) return parsed;
+  }
+
+  return null;
+}
+
 interface ModelAttemptTrace {
   model: string;
   ms: number;
@@ -54,19 +256,20 @@ async function generateContentWithRetryAndFallback(
   primaryModel: string,
   fallbackModel: string,
   userPrompt: string,
-  systemInstruction: string
-): Promise<{ response: any; modelUsed: string; trace: ModelAttemptTrace[] }> {
+  systemInstruction: string,
+  options?: { stageLabel?: string }
+): Promise<{ response: any; parsedJson?: Record<string, any>; modelUsed: string; trace: ModelAttemptTrace[] }> {
   const checkIsTransient = (error: any): boolean => {
-    let errorCode = error.status || error.statusCode || error.code;
+    let errorCode = error?.status || error?.statusCode || error?.code;
     let errorStatus = "";
-    let errorMsgStr = error.message || "";
+    let errorMsgStr = error?.message || "";
 
     try {
-      if (error.message && (error.message.startsWith("{") || error.message.includes('"error"'))) {
-        const startIdx = error.message.indexOf("{");
-        const endIdx = error.message.lastIndexOf("}");
+      if (errorMsgStr && (errorMsgStr.startsWith("{") || errorMsgStr.includes('"error"'))) {
+        const startIdx = errorMsgStr.indexOf("{");
+        const endIdx = errorMsgStr.lastIndexOf("}");
         if (startIdx !== -1 && endIdx !== -1) {
-          const jsonStr = error.message.substring(startIdx, endIdx + 1);
+          const jsonStr = errorMsgStr.substring(startIdx, endIdx + 1);
           const parsed = JSON.parse(jsonStr);
           if (parsed.error) {
             errorCode = parsed.error.code || errorCode;
@@ -79,26 +282,33 @@ async function generateContentWithRetryAndFallback(
       // ignore parsing error
     }
 
+    const lowerMsg = String(errorMsgStr).toLowerCase();
     const isTransient =
       errorCode === 503 ||
       errorCode === 429 ||
       errorCode === 500 ||
       errorCode === 504 ||
+      errorCode === 502 ||
       errorStatus === "UNAVAILABLE" ||
       errorStatus === "RESOURCE_EXHAUSTED" ||
-      errorMsgStr.includes("503") ||
-      errorMsgStr.includes("504") ||
-      errorMsgStr.includes("UNAVAILABLE") ||
-      errorMsgStr.includes("high demand") ||
-      errorMsgStr.includes("Resource exhausted") ||
-      errorMsgStr.includes("RESOURCE_EXHAUSTED") ||
-      errorMsgStr.includes("429") ||
-      errorMsgStr.includes("overloaded") ||
-      errorMsgStr.includes("timeout") ||
-      errorMsgStr.includes("Timeout") ||
-      errorMsgStr.includes("aborted");
+      lowerMsg.includes("503") ||
+      lowerMsg.includes("504") ||
+      lowerMsg.includes("502") ||
+      lowerMsg.includes("unavailable") ||
+      lowerMsg.includes("high demand") ||
+      lowerMsg.includes("resource exhausted") ||
+      lowerMsg.includes("resource_exhausted") ||
+      lowerMsg.includes("429") ||
+      lowerMsg.includes("overloaded") ||
+      lowerMsg.includes("timeout") ||
+      lowerMsg.includes("aborted") ||
+      lowerMsg.includes("econnreset") ||
+      lowerMsg.includes("socket") ||
+      lowerMsg.includes("fetch failed") ||
+      lowerMsg.includes("formato no estándar") ||
+      lowerMsg.includes("respuesta vacía");
 
-    return !!isTransient;
+    return Boolean(isTransient);
   };
 
   const modelsToTry = Array.from(
@@ -107,20 +317,21 @@ async function generateContentWithRetryAndFallback(
   let lastError: any = null;
   let anyTransient = false;
   const trace: ModelAttemptTrace[] = [];
+  const labelPrefix = options?.stageLabel ? `[${options.stageLabel}] ` : "";
 
   for (let i = 0; i < modelsToTry.length; i++) {
     const currentModel = modelsToTry[i];
-    const maxAttemptsForModel = i === 0 ? 2 : 1;
+    const maxAttemptsForModel = 2;
     let useThinking = true;
 
     for (let attempt = 1; attempt <= maxAttemptsForModel; attempt++) {
       const startedAt = Date.now();
-      const timeoutMs = i === 0 ? 55000 : 20000;
+      const timeoutMs = i === 0 ? 42000 : 34000;
       const controller = new AbortController();
       let timer: ReturnType<typeof setTimeout> | undefined;
 
       try {
-        console.log(`[Gemini API] Conectando con ${currentModel} (intento ${attempt}/${maxAttemptsForModel})...`);
+        console.log(`[Gemini API] ${labelPrefix}Conectando con ${currentModel} (intento ${attempt}/${maxAttemptsForModel})...`);
 
         const timeoutPromise = new Promise<never>((_, reject) => {
           timer = setTimeout(() => {
@@ -147,31 +358,39 @@ async function generateContentWithRetryAndFallback(
         const response = await Promise.race([generatePromise, timeoutPromise]);
         const responseText = response?.text;
         const ms = Date.now() - startedAt;
-        if (responseText && responseText.trim()) {
-          console.log(`[Gemini API] Respuesta completada exitosamente con ${currentModel} en ${ms}ms`);
-          trace.push({ model: currentModel, ms, ok: true });
-          return { response, modelUsed: currentModel, trace };
+
+        if (!responseText || !responseText.trim()) {
+          throw new Error(`Respuesta vacía del modelo ${currentModel}.`);
         }
-        throw new Error(`Respuesta vacía del modelo ${currentModel}.`);
+
+        const parsedJson = safeParseModelJson(responseText);
+        if (!parsedJson) {
+          throw new Error(`El modelo ${currentModel} generó un formato no estándar.`);
+        }
+
+        console.log(`[Gemini API] ${labelPrefix}Completado con ${currentModel} en ${ms}ms`);
+        trace.push({ model: currentModel, ms, ok: true });
+        return { response, parsedJson, modelUsed: currentModel, trace };
       } catch (error: any) {
         const ms = Date.now() - startedAt;
-        const errMsg = String(error?.message || "error").slice(0, 180);
+        const errMsg = String(error?.message || "error").slice(0, 200);
         trace.push({ model: currentModel, ms, ok: false, error: errMsg });
         lastError = error;
         const isTransient = checkIsTransient(error);
         if (isTransient) {
           anyTransient = true;
         }
-        console.log(`[Gemini API] Error en ${currentModel} (${ms}ms): ${errMsg}`);
+        console.log(`[Gemini API] ${labelPrefix}Error en ${currentModel} (${ms}ms): ${errMsg}`);
 
         if (useThinking && errMsg.toLowerCase().includes("thinking")) {
           useThinking = false;
           if (attempt < maxAttemptsForModel) continue;
         }
 
-        const isTimeout = errMsg.includes("Timeout de respuesta") || errMsg.includes("aborted");
-        if (attempt < maxAttemptsForModel && isTransient && !isTimeout && ms < 8000) {
-          await new Promise((r) => setTimeout(r, 700));
+        if (attempt < maxAttemptsForModel && isTransient) {
+          const jitter = Math.floor(Math.random() * 450);
+          const backoffMs = attempt * 950 + jitter;
+          await new Promise((r) => setTimeout(r, backoffMs));
           continue;
         }
         break;
@@ -184,10 +403,11 @@ async function generateContentWithRetryAndFallback(
   const isHighDemand = anyTransient || checkIsTransient(lastError);
   const err: any = new Error(
     isHighDemand
-      ? "Los servidores de Google AI Studio están experimentando una alta demanda temporal (503). Por favor, intenta de nuevo en unos instantes."
-      : `No fue posible completar la solicitud con el motor de IA. Detalle: ${lastError?.message || "Servicio no disponible"}`
+      ? "El servicio de análisis experimentó una saturación o intermitencia temporal (503/Timeout). Tu progreso previo quedó guardado para continuar desde este punto."
+      : `No fue posible completar esta etapa con el motor de IA. Detalle: ${lastError?.message || "Servicio no disponible"}`
   );
   err.trace = trace;
+  err.retryable = isHighDemand;
   throw err;
 }
 
@@ -250,7 +470,6 @@ async function checkAndResolveUrl(rawUrl: string, timeoutMs = 2000): Promise<str
     }
     return finalUrl;
   } catch (err: any) {
-    // AbortError or transient timeout on a known direct URL: keep direct URL unless DNS/conn refused
     const code = err?.cause?.code || err?.code || "";
     if (code === "ENOTFOUND" || code === "ECONNREFUSED" || code === "ERR_TLS_CERT_ALTNAME_INVALID") {
       return undefined;
@@ -367,7 +586,6 @@ async function enrichAndVerifyRecommendedResources(
     });
   }
 
-  // Ensure sitiosWeb includes up to 3 top verified grounded web links if not already present
   if (groundedSources.length > 0) {
     const existingUrls = new Set(
       nextResources.sitiosWeb.map((s) => s.url).filter((u): u is string => Boolean(u))
@@ -385,6 +603,460 @@ async function enrichAndVerifyRecommendedResources(
   }
 
   return nextResources;
+}
+
+function buildCoreSystemInstruction(selectedTradition: string): string {
+  const isSabiduriaPractica =
+    selectedTradition === "Sabiduría práctica y habilidades sociales" ||
+    selectedTradition.toLowerCase().includes("sabiduría práctica") ||
+    selectedTradition.toLowerCase().includes("habilidades sociales");
+
+  const sabiduriaPracticaPrompt = isSabiduriaPractica
+    ? `
+MARCO OBLIGATORIO ACTIVO: "Sabiduría práctica y habilidades sociales".
+Ajusta todo el análisis y recomendaciones a:
+1. Sabiduría Práctica Aplicada (Phrónēsis): prudencia operativa, timing oportuno, sobriedad emocional y consecuencias de 2º/3º orden.
+2. Inteligencia Interpersonal y Habilidades Sociales: comunicación asertiva (qué decir y tono), empatía/calibración, negociación ganar-ganar y límites saludables.
+`
+    : "";
+
+  return `
+Eres el "Sistema Universal de Análisis Integral, Investigación, Discernimiento y Toma de Decisiones Objetivas".
+La aplicación es GENERAL, ABIERTA Y MULTIDISCIPLINARIA (ciencia, tecnología, negocios, finanzas, decisiones personales, salud, psicología, filosofía, ética, sociedad, historia, derecho o teología).
+
+REGLAS EPISTEMOLÓGICAS:
+1. ADAPTACIÓN OBJETIVA:
+   - Consultas científicas, técnicas, financieras o seculares: aplica rigor empírico, lógica formal y análisis costo/beneficio sin forzar lenguaje teológico.
+   - Consultas teológicas o bíblicas: aplica máxima rigurosidad exegética histórico-gramatical (hebreo/griego, contexto, sintaxis).
+   - Dilemas éticos o complejos: pondera equilibradamente evidencia empírica, viabilidad y principios éticos universales.
+2. RIGOR Y DISTINCIÓN:
+   - Distingue estrictamente entre hechos comprobados, inferencias lógicas, hipótesis y opiniones.
+   - NUNCA inventes datos, cifras ficticias, citas bíblicas inexistentes o estudios falsos. Declara límites metodológicos cuando existan.
+3. ABUNDANCIA CON SUSTANCIA (SIN RELLENO):
+   - Desarrolla cada apartado con mecanismos causales reales, criterios verificables y ejemplos concretos.
+${sabiduriaPracticaPrompt}
+4. SALIDA ESTRICTA:
+   - Responde ÚNICAMENTE con un objeto JSON válido que cumpla exactamente el sub-esquema solicitado en esta etapa. No incluyas texto fuera del JSON.
+`;
+}
+
+function buildStageDigest(partialData: Record<string, any>): string {
+  const parts: string[] = [];
+  if (typeof partialData.resumenEjecutivo === "string" && partialData.resumenEjecutivo) {
+    parts.push(`Resumen previo: ${partialData.resumenEjecutivo.slice(0, 600)}`);
+  }
+  if (typeof partialData.comprensionProblema === "string" && partialData.comprensionProblema) {
+    parts.push(`Problema central: ${partialData.comprensionProblema.slice(0, 450)}`);
+  }
+  if (partialData.sintesisClave?.ideaPrincipal) {
+    parts.push(`Idea principal: ${String(partialData.sintesisClave.ideaPrincipal).slice(0, 300)}`);
+  }
+  if (typeof partialData.esBiblico === "boolean") {
+    parts.push(`esBiblico=${partialData.esBiblico}, esCientifico=${Boolean(partialData.esCientifico)}`);
+  }
+  if (Array.isArray(partialData.perspectivas) && partialData.perspectivas.length > 0) {
+    const names = partialData.perspectivas.map((p: any) => p?.nombre).filter(Boolean).join(" | ");
+    if (names) parts.push(`Perspectivas evaluadas: ${names}`);
+  }
+  if (partialData.recomendacionFinal?.recomendacion) {
+    parts.push(`Recomendación adoptada: ${String(partialData.recomendacionFinal.recomendacion).slice(0, 350)}`);
+  }
+  return parts.length > 0 ? `\nCONTEXTO YA GENERADO EN ETAPAS PREVIAS (mantén plena coherencia):\n${parts.join("\n")}\n` : "";
+}
+
+function buildStagePrompt(
+  stage: AnalysisStageId,
+  topic: string,
+  focusType: string,
+  selectedTradition: string,
+  partialData: Record<string, any>
+): string {
+  const header = `Consulta a analizar: "${topic}"
+Categoría / Enfoque solicitado: "${focusType}"
+Marco de Referencia Adicional: "${selectedTradition}"
+${buildStageDigest(partialData)}`;
+
+  switch (stage) {
+    case "base":
+      return `${header}
+TAREA — ETAPA 1 DE 4 (Comprensión, Síntesis, Glosario y Contexto 5D):
+Genera ÚNICAMENTE un JSON válido con estos campos exactos:
+{
+  "resumenEjecutivo": "2 a 3 párrafos sustanciosos que sinteticen tesis, tensión central y veredicto preliminar.",
+  "comprensionProblema": "Desglose profundo entre la pregunta superficial, el dilema subyacente, restricciones reales y efectos de segundo orden.",
+  "sintesisClave": {
+    "deQueTrata": "Respuesta clara y directa a ¿De qué trata?",
+    "ideaPrincipal": "Tesis o idea fundamental.",
+    "argumentos": ["Argumento clave 1", "Argumento clave 2", "Argumento clave 3"],
+    "conclusion": "Conclusión sintética clara."
+  },
+  "definiciones": [
+    {
+      "termino": "Término clave (incluye 5 a 7 términos relevantes)",
+      "definicion": "Explicación académica o técnica precisa.",
+      "explicacionSencilla": "Explicación cotidiana sencilla estilo principiante con analogía clara (SIN repetir el texto técnico)."
+    }
+  ],
+  "contexto": {
+    "historico": "3 a 5 oraciones concretas sobre el contexto histórico.",
+    "cultural": "3 a 5 oraciones concretas sobre el contexto cultural/social.",
+    "cientifico": "3 a 5 oraciones concretas sobre la base científica o empírica.",
+    "biblico": "3 a 5 oraciones prudentes y objetivas sobre el ángulo ético o bíblico.",
+    "practico": "3 a 5 oraciones sobre la aplicación práctica cotidiana."
+  },
+  "esBiblico": false,
+  "esCientifico": false
+}
+Regla: Determina con precisión si "esBiblico" o "esCientifico" deben ser true o false según la materia real de la consulta y el enfoque solicitado.`;
+
+    case "investigacion": {
+      const wantBiblical =
+        Boolean(partialData.esBiblico) ||
+        focusType.toLowerCase().includes("bíblic") ||
+        focusType.toLowerCase().includes("teológ");
+      const wantScientific =
+        Boolean(partialData.esCientifico) ||
+        focusType.toLowerCase().includes("cienc") ||
+        focusType.toLowerCase().includes("salud");
+
+      return `${header}
+TAREA — ETAPA 2 DE 4 (Investigación Multidisciplinaria, Perspectivas y Comparación):
+Genera ÚNICAMENTE un JSON válido con estos campos exactos:
+{
+  "analisisMultidisciplinario": [
+    {
+      "disciplina": "Nombre de disciplina (incluye 5 a 7 disciplinas verdaderamente relevantes)",
+      "analisis": "Análisis profundo con mecanismos, datos o principios concretos.",
+      "relevancia": "Alta | Media | Baja"
+    }
+  ],
+  "perspectivas": [
+    {
+      "nombre": "Postura o corriente real diferenciada (incluye 3 a 4 perspectivas)",
+      "fortalezas": ["Fortaleza específica 1", "Fortaleza 2", "Fortaleza 3"],
+      "debilidades": ["Debilidad específica 1", "Debilidad 2", "Debilidad 3"]
+    }
+  ],
+  "comparacionObjetiva": {
+    "evidencia": "Comparación rigurosa de la solidez empírica entre posturas.",
+    "coherenciaLogica": "Análisis de consistencia lógica interna.",
+    "resultadosObservables": "Resultados verificables en la realidad práctica.",
+    "compatibilidadBiblica": "Alineación o tensión con principios éticos y bíblicos.",
+    "riesgos": "Comparación directa de riesgos por postura.",
+    "beneficios": "Comparación de beneficios esperados.",
+    "limitaciones": "Limitaciones metodológicas o de alcance."
+  }${
+    wantBiblical
+      ? `,
+  "especificosBiblicos": {
+    "contextoHistoricoBiblico": "Contexto histórico detallado.",
+    "contextoLiterario": "Género, estructura y flujo de pensamiento.",
+    "propositoAutor": "Propósito original del autor.",
+    "destinatarios": "Audiencia original.",
+    "principioUniversal": "Principio ético/espiritual inmutable.",
+    "aplicacionActual": "Aplicación contemporánea fiel.",
+    "pasajesRelacionados": ["Libro Cap:Ver - breve relación"],
+    "posiblesMalasInterpretaciones": [
+      { "interpretacion": "Lectura errónea común", "refutacion": "Refutación exegética rigurosa" }
+    ],
+    "conclusionExegetica": "Conclusión formal exegética."
+  }`
+      : ""
+  }${
+    wantScientific
+      ? `,
+  "especificosCientificos": {
+    "nivelEvidencia": "Jerarquía de evidencia científica disponible.",
+    "consensoCientifico": "Estado actual del consenso científico.",
+    "limitacionesCientificas": "Brechas y limitaciones de los estudios.",
+    "estudiosContradictorios": ["Línea de evidencia o hallazgos divergentes"],
+    "gradoCerteza": "Grado de certeza científica (Alto/Moderado/Bajo) y por qué."
+  }`
+      : ""
+  }
+}`;
+    }
+
+    case "decision":
+      return `${header}
+TAREA — ETAPA 3 DE 4 (Matriz de Decisiones, Recomendación, Riesgos y Plan de Implementación):
+Genera ÚNICAMENTE un JSON válido con estos campos exactos:
+{
+  "matrizDecisiones": [
+    {
+      "alternativa": "Alternativa realista (incluye 4 a 5 alternativas, considerando status quo e híbrida)",
+      "pros": ["Pro concreto 1", "Pro 2", "Pro 3"],
+      "contras": ["Contra concreto 1", "Contra 2", "Contra 3"],
+      "costo": "Bajo / Medio / Alto / Estimación",
+      "tiempo": "Inmediato / Corto / Mediano / Largo plazo",
+      "riesgo": "Bajo / Medio / Alto",
+      "beneficio": "Bajo / Medio / Alto",
+      "impacto": "Bajo / Medio / Alto / Muy Alto",
+      "factibilidad": "Baja / Media / Alta"
+    }
+  ],
+  "recomendacionFinal": {
+    "recomendacion": "Recomendación estratégica clara y fundamentada.",
+    "justificacion": "Justificación detallada basada en evidencia y ponderación de alternativas.",
+    "nivelConfianza": 88,
+    "porqueConfianza": "Razón explícita del porcentaje de confianza y qué factores lo limitan."
+  },
+  "riesgos": [
+    {
+      "riesgo": "Riesgo concreto (incluye 4 a 5 riesgos)",
+      "prevencion": "Medida concreta para evitarlo.",
+      "solucion": "Plan de contingencia si ocurre."
+    }
+  ],
+  "planPasoAPaso": [
+    { "paso": 1, "titulo": "Título de fase (incluye 5 a 7 pasos secuenciales)", "descripcion": "Instrucciones concretas y ejecutables." }
+  ],
+  "accionesPracticas": {
+    "inmediatas": ["3 acciones medibles para hoy/mañana"],
+    "estaSemana": ["3 acciones para los próximos 7 días"],
+    "esteMes": ["3 acciones para las próximas 4 semanas"],
+    "largoPlazo": ["3 hábitos o metas sostenibles"]
+  },
+  "erroresComunes": [
+    { "error": "Error frecuente (incluye 4 a 5 errores)", "comoEvitarlo": "Pauta práctica para evitarlo." }
+  ],
+  "listaVerificacion": [
+    "6 a 8 criterios concretos de verificación"
+  ],
+  "resumenFinal": {
+    "queHacer": ["3 a 5 acciones clave recomendadas"],
+    "queNoHacer": ["3 a 5 acciones desaconsejadas"],
+    "porque": "Síntesis del fundamento de estas directrices."
+  }
+}`;
+
+    case "validacion":
+      return `${header}
+TAREA — ETAPA 4 DE 4 (Auditoría Crítica, Test Diagnóstico, Discernimiento y Recursos):
+Genera ÚNICAMENTE un JSON válido con estos campos exactos:
+{
+  "auditoriaRazonamiento": {
+    "supuestosHechos": ["3 a 4 supuestos implícitos/explícitos del análisis"],
+    "evidenciaContradictoria": ["3 a 4 datos o argumentos que desafían la conclusión"],
+    "informacionFaltante": ["3 a 4 datos adicionales que elevarían la certeza"],
+    "sesgosCognitivos": [
+      { "sesgo": "Nombre del sesgo (3 a 4 sesgos)", "descripcion": "Definición breve.", "comoAfecta": "Cómo distorsiona este dilema específico." }
+    ],
+    "escenariosFalla": ["3 escenarios donde la recomendación dejaría de aplicar"],
+    "disparadoresCambio": ["3 señales o datos concretos que obligarían a cambiar de postura"]
+  },
+  "testDiagnostico": {
+    "tituloTest": "Test Diagnóstico sobre ${topic.slice(0, 80)}",
+    "descripcion": "Cuestionario de 5 preguntas para medir dominio objetivo del tema y vulnerabilidad a sesgos psicológicos.",
+    "preguntas": [
+      {
+        "id": 1,
+        "pregunta": "Pregunta precisa (incluye 5 a 6 preguntas)",
+        "dimension": "conocimiento | psicologico | ambos",
+        "opciones": [
+          { "letra": "A", "texto": "Opción intuitiva o con mito común", "puntajeConocimiento": 5, "puntajePsicologico": 8, "explicacionEvaluativa": "Qué revela esta opción." },
+          { "letra": "B", "texto": "Opción parcial", "puntajeConocimiento": 12, "puntajePsicologico": 14, "explicacionEvaluativa": "Evaluación intermedia." },
+          { "letra": "C", "texto": "Opción sólida", "puntajeConocimiento": 20, "puntajePsicologico": 20, "explicacionEvaluativa": "Evaluación avanzada." },
+          { "letra": "D", "texto": "Opción rigurosa y madura", "puntajeConocimiento": 25, "puntajePsicologico": 25, "explicacionEvaluativa": "Evaluación sobresaliente." }
+        ]
+      }
+    ],
+    "interpretacionConocimiento": {
+      "nivelAlto": "Interpretación puntaje alto.",
+      "nivelMedio": "Interpretación puntaje medio.",
+      "nivelBajo": "Interpretación puntaje bajo."
+    },
+    "interpretacionPsicologica": {
+      "nivelMaduro": "Alta estabilidad y objetividad.",
+      "nivelModerado": "Disposición moderada con sesgos controlables.",
+      "nivelVulnerable": "Alta vulnerabilidad emocional o sesgo."
+    }
+  },
+  "teologiaEvangelica": {
+    "evaluacionMotivosCorazon": {
+      "motivosSubyacentes": ["Motivaciones humanas profundas en juego"],
+      "posiblesIdolosCorazon": ["Búsqueda de control, aprobación, comodidad, etc."],
+      "consejoPastoralDeseos": "Consejo prudente, respetuoso y reflexivo sobre las motivaciones internas."
+    },
+    "impactoEclesiologicoPastoral": {
+      "servicioYComunidad": "Impacto en comunidad y servicio al prójimo.",
+      "testimonioPublico": "Integridad y testimonio público.",
+      "discipuladoYFamilia": "Formación ética, familiar y carácter."
+    },
+    "marcoRedentorCristocentrico": {
+      "creacion": "Principio de orden y propósito constructivo.",
+      "caida": "Cómo la fragilidad o el error distorsionan este tema.",
+      "redencion": "Camino de restauración, gracia y sabiduría.",
+      "consumacion": "Perspectiva de esperanza y trascendencia.",
+      "conexionEvangelio": "Síntesis respetuosa de cómo se conecta con la gracia (sin forzar dogma si el tema es estrictamente técnico)."
+    },
+    "concordanciaOriginal": [
+      {
+        "pasaje": "Pasaje pertinente o principio ético clásico",
+        "palabrasOriginales": [
+          { "palabra": "Τérmino original", "transliteracion": "transliteracion", "idioma": "Griego | Hebreo", "strong": "G0000", "traduccionLiteral": "Traducción literal", "significadoTeologico": "Significado en contexto" }
+        ],
+        "contextoExegetico": "Nota breve de contexto."
+      }
+    ]
+  },
+  "recursosRecomendados": {
+    "libros": [{ "titulo": "Título real del libro (2-3 por categoría)", "autor": "Autor", "url": "" }],
+    "articulos": [{ "titulo": "Artículo o referencia académica real", "url": "" }],
+    "sitiosWeb": [{ "titulo": "Portal oficial reconocido", "url": "URL https:// real solo si estás 100% seguro, o \"\"" }],
+    "videos": [{ "titulo": "Conferencia o canal educativo real", "url": "" }],
+    "cursos": [{ "titulo": "Curso o plataforma reconocida", "url": "" }],
+    "herramientas": [{ "titulo": "Herramienta o marco práctico", "url": "" }],
+    "ias": [{ "titulo": "Aplicación de IA útil para este tema", "url": "" }],
+    "software": [{ "titulo": "Software digital relevante", "url": "" }],
+    "plantillas": [{ "titulo": "Plantilla o framework aplicable", "url": "" }]
+  }
+}
+REGLA URLs: NUNCA inventes URLs ni rutas largas ficticias; deja "url": "" si no conoces el dominio oficial exacto con certeza absoluta.`;
+  }
+}
+
+async function executeSingleStage(
+  ai: GoogleGenAI,
+  stage: AnalysisStageId,
+  params: {
+    topic: string;
+    focusType: string;
+    tradicionTeologica: string;
+    partialData: Record<string, any>;
+  }
+): Promise<Record<string, any>> {
+  const { topic, focusType, tradicionTeologica, partialData } = params;
+  const systemInstruction = buildCoreSystemInstruction(tradicionTeologica);
+  const userPrompt = buildStagePrompt(stage, topic, focusType, tradicionTeologica, partialData);
+
+  const groundedSourcesPromise =
+    stage === "validacion"
+      ? fetchGroundedSourcesForTopic(ai, topic).catch(() => [] as GroundedWebSource[])
+      : Promise.resolve([] as GroundedWebSource[]);
+
+  const { parsedJson } = await generateContentWithRetryAndFallback(
+    ai,
+    "gemini-3.1-flash-lite",
+    "gemini-4-hydrogen",
+    userPrompt,
+    systemInstruction,
+    { stageLabel: `Etapa ${stage}` }
+  );
+
+  const safeStageFields = pickSafePartialAnalysisData(parsedJson);
+
+  if (stage === "validacion") {
+    const rawRec = safeStageFields.recursosRecomendados || {};
+    const sanitizedResources: RecommendedResources = {
+      libros: sanitizeResourceList(rawRec.libros, "Libro recomendado"),
+      articulos: sanitizeResourceList(rawRec.articulos, "Artículo científico"),
+      sitiosWeb: sanitizeResourceList(rawRec.sitiosWeb, "Sitio web recomendado"),
+      videos: sanitizeResourceList(rawRec.videos, "Video recomendado"),
+      cursos: sanitizeResourceList(rawRec.cursos, "Curso recomendado"),
+      herramientas: sanitizeResourceList(rawRec.herramientas, "Herramienta recomendada"),
+      ias: sanitizeResourceList(rawRec.ias, "Herramienta de IA"),
+      software: sanitizeResourceList(rawRec.software, "Software recomendado"),
+      plantillas: sanitizeResourceList(rawRec.plantillas, "Plantilla recomendada"),
+    };
+
+    const groundedSources = await Promise.race([
+      groundedSourcesPromise,
+      new Promise<GroundedWebSource[]>((resolve) => setTimeout(() => resolve([]), 1500)),
+    ]);
+
+    safeStageFields.recursosRecomendados = await enrichAndVerifyRecommendedResources(
+      sanitizedResources,
+      groundedSources
+    );
+  }
+
+  return safeStageFields;
+}
+
+function finalizeJobIfComplete(job: AnalysisJobRecord): boolean {
+  const nextStage = getNextPendingStage(job.completedStages);
+  if (!nextStage) {
+    job.status = "completed";
+    job.currentStage = null;
+    job.failedStage = null;
+    job.error = undefined;
+    job.retryable = false;
+    job.result = sanitizeAnalysisResponse(job.partialData);
+    job.updatedAt = Date.now();
+    persistJobCheckpoint(job);
+    return true;
+  }
+  job.currentStage = nextStage;
+  job.updatedAt = Date.now();
+  persistJobCheckpoint(job);
+  return false;
+}
+
+async function runJobStagesInBackground(jobId: string): Promise<void> {
+  if (activeJobRunners.has(jobId)) return;
+  activeJobRunners.add(jobId);
+
+  try {
+    const ai = getGeminiClient();
+    const job = loadJobCheckpoint(jobId);
+    if (!job) return;
+
+    while (true) {
+      const nextStage = getNextPendingStage(job.completedStages);
+      if (!nextStage) {
+        finalizeJobIfComplete(job);
+        break;
+      }
+
+      job.status = "running";
+      job.currentStage = nextStage;
+      job.failedStage = null;
+      job.error = undefined;
+      job.updatedAt = Date.now();
+      persistJobCheckpoint(job);
+
+      try {
+        const stageData = await executeSingleStage(ai, nextStage, {
+          topic: job.topic,
+          focusType: job.focusType,
+          tradicionTeologica: job.tradicionTeologica,
+          partialData: job.partialData,
+        });
+
+        job.partialData = {
+          ...job.partialData,
+          ...stageData,
+        };
+        job.completedStages = filterValidStageIds([...job.completedStages, nextStage]);
+        const isDone = finalizeJobIfComplete(job);
+
+        if (isDone) {
+          break;
+        }
+      } catch (stageErr: any) {
+        job.status = "paused_error";
+        job.failedStage = nextStage;
+        job.currentStage = nextStage;
+        job.error = stageErr?.message || `Error al procesar la etapa ${nextStage}.`;
+        job.retryable = stageErr?.retryable !== false;
+        job.updatedAt = Date.now();
+        persistJobCheckpoint(job);
+        break;
+      }
+    }
+  } catch (fatalErr: any) {
+    const job = loadJobCheckpoint(jobId);
+    if (job) {
+      job.status = "paused_error";
+      job.error = fatalErr?.message || "Error al inicializar el motor de análisis.";
+      job.retryable = false;
+      job.updatedAt = Date.now();
+      persistJobCheckpoint(job);
+    }
+  } finally {
+    activeJobRunners.delete(jobId);
+  }
 }
 
 export function createApp() {
@@ -406,7 +1078,6 @@ export function createApp() {
     next();
   });
 
-  // Compatibility auth status endpoint (PIN access lock removed per user request)
   app.get("/api/auth/status", (_req: Request, res: Response) => {
     res.json({
       serverProtected: false,
@@ -416,14 +1087,14 @@ export function createApp() {
     });
   });
 
-  // Per-IP quota guard (40 requests / 10 min) without PIN blocking
+  // Per-IP mutation quota guard (60 requests / 10 min)
   const requireAuth = (req: Request, res: Response, next: NextFunction) => {
     const ip = getClientIp(req);
     const now = Date.now();
-    const usage = apiRequests.get(ip);
+    const usage = apiMutationRequests.get(ip);
     if (!usage || usage.resetAt <= now) {
-      apiRequests.set(ip, { count: 1, resetAt: now + 10 * 60 * 1000 });
-    } else if (usage.count >= 40) {
+      apiMutationRequests.set(ip, { count: 1, resetAt: now + 10 * 60 * 1000 });
+    } else if (usage.count >= 60) {
       res.status(429).json({
         error: "Límite de seguridad de consultas alcanzado temporalmente. Intenta en unos minutos.",
       });
@@ -431,422 +1102,365 @@ export function createApp() {
     } else {
       usage.count += 1;
     }
-
     next();
   };
 
-  // REST API for comprehensive analysis
-  app.post("/api/analyze", requireAuth, async (req: Request, res: Response) => {
+  // Generous read-only limiter for job status polling (600 requests / 10 min)
+  const pollQuotaGuard = (req: Request, res: Response, next: NextFunction) => {
+    const ip = getClientIp(req);
+    const now = Date.now();
+    const usage = apiPollRequests.get(ip);
+    if (!usage || usage.resetAt <= now) {
+      apiPollRequests.set(ip, { count: 1, resetAt: now + 10 * 60 * 1000 });
+    } else if (usage.count >= 600) {
+      res.status(429).json({
+        error: "Demasiadas solicitudes de verificación seguidas. Espera unos segundos.",
+      });
+      return;
+    } else {
+      usage.count += 1;
+    }
+    next();
+  };
+
+  // Start a checkpointed, resumable analysis job
+  app.post("/api/analyze/jobs", requireAuth, (req: Request, res: Response) => {
     try {
-      const { topic, focusType, tradicionTeologica } = req.body;
+      const {
+        topic,
+        focusType,
+        tradicionTeologica,
+        jobId: requestedJobId,
+        completedStages: rawCompleted,
+        partialData: rawPartial,
+      } = req.body || {};
 
-      const selectedTradition = tradicionTeologica || "General / No Denominacional";
-
-      if (!topic || typeof topic !== "string") {
+      if (!topic || typeof topic !== "string" || !topic.trim()) {
         res.status(400).json({ error: "El tema de consulta es requerido." });
         return;
       }
 
-      const ai = getGeminiClient();
+      const cleanTopic = topic.trim().slice(0, 4000);
+      const cleanFocus =
+        typeof focusType === "string" && focusType.trim() ? focusType.trim().slice(0, 200) : "General";
+      const cleanTradition =
+        typeof tradicionTeologica === "string" && tradicionTeologica.trim()
+          ? tradicionTeologica.trim().slice(0, 200)
+          : "General / Neutral (Sin Sesgo)";
 
-      const systemInstruction = `
-Eres el "Sistema Universal de Análisis Integral, Investigación, Discernimiento y Toma de Decisiones Objetivas".
-La aplicación es de carácter GENERAL, ABIERTO Y MULTIDISCIPLINARIO para responder y analizar cualquier tipo de consulta (ciencia, tecnología, negocios, finanzas, toma de decisiones personales, salud, psicología, filosofía, ética, sociedad, historia, derecho o teología).
+      const jobId = isValidUuid(requestedJobId) ? requestedJobId : crypto.randomUUID();
+      const existing = loadJobCheckpoint(jobId);
 
-Tu propósito es ayudar al usuario a comprender profundamente cualquier tema y tomar decisiones fundamentadas con la máxima OBJETIVIDAD, RIGOR Y NEUTRALIDAD METODOLÓGICA (SIN SESGO DE CONFIRMACIÓN O DOGMÁTICO).
+      const seededStages = filterValidStageIds(rawCompleted);
+      const seededPartial = pickSafePartialAnalysisData(rawPartial);
 
-REGLAS FUNDAMENTALES DE ADAPTACIÓN EPISTEMOLÓGICA SEGÚN EL TEMA:
-1. RIGOR Y LENGUAJE ADAPTATIVO:
-   - Si la consulta es NETAMENTE CIENTÍFICA, TÉCNICA, FINANCIERA O SECULAR (ej. medicina, informática, inversiones, derecho, biología, ingeniería): Aplica rigurosidad científica pura, basada en evidencia empírica, lógica formal, análisis de datos y costo/beneficio. NO fuerces lenguaje de estudio bíblico ni sermones teológicos sobre temas seculares donde no corresponda.
-   - Si la consulta es TEOLÓGICA O BÍBLICA: Aplica máxima rigurosidad exegética y hermenéutica histórico-gramatical, analizando términos originales en idiomas bíblicos (hebreo/griego), contexto histórico y sintaxis.
-   - Si la consulta es UN DILEMA ÉTICO O TOMA DE DECISIONES COMPLEJA: Pondera equilibradamente la lógica, la ciencia, la viabilidad práctica y los principios éticos/morales universales.
+      const mergedPartial = {
+        ...seededPartial,
+        ...(existing?.partialData || {}),
+      };
+      const mergedStages = filterValidStageIds([
+        ...seededStages,
+        ...(existing?.completedStages || []),
+      ]);
 
-2. PONDERACIÓN MULTIDISCIPLINARIA:
-   - Incluye perspectivas de múltiples disciplinas (Ciencia, Lógica, Filosofía, Ética, Economía, Psicología, Teología, Derecho, etc.), ajustando el peso de cada una a la naturaleza real del problema.
-   - Distingue de forma estricta entre: Hechos comprobados empíricamente, Inferencias lógicas, Hipótesis, Opiniones, Tradiciones y Especulaciones. Nunca presentes opiniones como si fueran hechos.
+      const nextStage = getNextPendingStage(mergedStages);
+      const now = Date.now();
 
-3. REGLA OBLIGATORIA PARA DEFINICIONES CLAVE:
-   - Para cada elemento en la lista 'definiciones', DEBES proporcionar DILIGENTEMENTE dos explicaciones distintas:
-     a) 'definicion': La explicación técnica, académica o formal precisa.
-     b) 'explicacionSencilla': Una explicación en lenguaje popular, sencillo y cotidiano (estilo 'Layman' / para principiantes) usando analogías o lenguaje común. NUNCA repitas el texto ni las palabras complejas de 'definicion'.
-
-METODOLOGÍA OBLIGATORIA:
-1. Comprender la pregunta y el verdadero problema subyacente.
-2. Identificar objetivos y detectar supuestos ocultos.
-3. Analizar riesgos y buscar alternativas creativas.
-4. Comparar soluciones de manera objetiva y cuantitativa/cualitativa.
-5. Realizar una auto-auditoría crítica del propio razonamiento.
-
-FORMATO DE SALIDA:
-Debes responder strictly en formato JSON utilizando el esquema que se te provee. No agregues explicaciones fuera de la estructura JSON.
-El formato de respuesta JSON debe contener con exactitud los siguientes campos:
-
-{
-  "resumenEjecutivo": "Explicar el problema en pocas líneas de forma clara y directa.",
-  "comprensionProblema": "Explicar qué realmente está preguntando el usuario y cuál es el verdadero problema o dilema de fondo.",
-  "sintesisClave": {
-    "deQueTrata": "Respuesta sintetizada, clara y directa a: ¿De qué trata el tema o la consulta?",
-    "ideaPrincipal": "Respuesta precisa a: ¿Cuál es la idea principal o tesis fundamental?",
-    "argumentos": [
-      "Argumento principal 1 con su evidencia o lógica clave",
-      "Argumento principal 2 de peso multidisciplinario",
-      "Argumento principal 3 de contraste o viabilidad"
-    ],
-    "conclusion": "Respuesta determinante y clara a: ¿Cuál es la conclusión o dictamen final?"
-  },
-  "definiciones": [
-    { 
-      "termino": "Concepto clave 1", 
-      "definicion": "Explicación académica o técnica detallada y precisa.",
-      "explicacionSencilla": "Explicación súper sencilla y fácil de entender en lenguaje cotidiano / para principiantes (estilo 'Layman'). NUNCA repetir el texto de la definición técnica."
-    }
-  ],
-  "contexto": {
-    "historico": "Contexto histórico del asunto.",
-    "cultural": "Contexto cultural o social actual o histórico.",
-    "cientifico": "Contexto científico, descubrimientos o teorías asociadas.",
-    "biblico": "Contexto bíblico o ético-teológico relevante.",
-    "practico": "Contexto práctico o cotidiano donde se aplica el tema."
-  },
-  "analisisMultidisciplinario": [
-    {
-      "disciplina": "Biblia / Ciencia / Psicología / Filosofía / Ética / Medicina / Economía / Sociología / Historia / Educación / Administración / Tecnología / Derecho",
-      "analisis": "Análisis profundo desde esta perspectiva disciplinaria.",
-      "relevancia": "Alta"
-    }
-  ],
-  "perspectivas": [
-    {
-      "nombre": "Perspectiva A (ej. Tradicional, Pragmática, Escéptica, Conservadora, etc.)",
-      "fortalezas": ["Fortaleza 1", "Fortaleza 2"],
-      "debilidades": ["Debilidad 1", "Debilidad 2"]
-    }
-  ],
-  "comparacionObjetiva": {
-    "evidencia": "Resumen de la solidez de la evidencia para cada postura.",
-    "coherenciaLogica": "Análisis de la coherencia lógica interna de los argumentos.",
-    "resultadosObservables": "Resultados prácticos que se pueden verificar empíricamente.",
-    "compatibilidadBiblica": "Grado de alineación con principios bíblicos exegéticos.",
-    "riesgos": "Comparación de riesgos de tomar una postura u otra.",
-    "beneficios": "Comparación de beneficios esperados.",
-    "limitaciones": "Limitaciones metodológicas o conceptuales de lo analizado."
-  },
-  "recursosRecomendados": {
-    "libros": [
-      { "titulo": "Título exacto del libro", "autor": "Nombre del autor", "url": "URL https:// real y verificable (sitio oficial, Google Books, OpenLibrary o editorial) si estás 100% seguro, o \"\"" }
-    ],
-    "articulos": [
-      { "titulo": "Título exacto o referencia académica con autores", "url": "URL https:// real de DOI (https://doi.org/...), PubMed, SciELO o revista científica si estás 100% seguro, o \"\"" }
-    ],
-    "sitiosWeb": [
-      { "titulo": "Nombre descriptivo del portal web confiable", "url": "URL oficial https:// exacta y real del sitio (ej. https://es.khanacademy.org)" }
-    ],
-    "videos": [
-      { "titulo": "Título de conferencia, canal educativo o video relevante", "url": "URL https:// real de YouTube/TED/canal oficial si estás 100% seguro, o \"\"" }
-    ],
-    "cursos": [
-      { "titulo": "Nombre del curso o especialización y plataforma", "url": "URL https:// real de Coursera, edX, MIT OCW, Platzi o plataforma oficial si estás 100% seguro, o \"\"" }
-    ],
-    "herramientas": [
-      { "titulo": "Nombre de la herramienta o marco de trabajo", "url": "URL oficial https:// real de la herramienta si existe" }
-    ],
-    "ias": [
-      { "titulo": "Aplicación de IA recomendada y caso de uso", "url": "URL oficial https:// real de la aplicación (ej. https://notebooklm.google.com)" }
-    ],
-    "software": [
-      { "titulo": "Nombre del software, sistema o app digital", "url": "URL oficial https:// real del software (ej. https://www.notion.so)" }
-    ],
-    "plantillas": [
-      { "titulo": "Nombre de la plantilla, hoja de cálculo o framework práctico", "url": "URL oficial https:// real si existe, o \"\"" }
-    ]
-  },
-  "accionesPracticas": {
-    "inmediatas": ["Acción específica, medible y realista para hoy/mañana"],
-    "estaSemana": ["Acción para los siguientes 7 días"],
-    "esteMes": ["Acción para las próximas 4 semanas"],
-    "largoPlazo": ["Objetivo o práctica continua a largo plazo"]
-  },
-  "riesgos": [
-    {
-      "riesgo": "Descripción de un riesgo potencial al actuar o decidir.",
-      "prevencion": "Cómo prevenir que este riesgo se materialice.",
-      "solucion": "Cómo mitigar o solucionar si ocurre."
-    }
-  ],
-  "matrizDecisiones": [
-    {
-      "alternativa": "Alternativa o curso de acción 1",
-      "pros": ["Pro 1", "Pro 2"],
-      "contras": ["Contra 1", "Contra 2"],
-      "costo": "Bajo / Medio / Alto / Estimación",
-      "tiempo": "Inmediato / Corto plazo / Mediano plazo / Largo plazo",
-      "riesgo": "Bajo / Medio / Alto",
-      "beneficio": "Bajo / Medio / Alto",
-      "impacto": "Bajo / Medio / Alto / Muy Alto",
-      "factibilidad": "Baja / Media / Alta"
-    }
-  ],
-  "recomendacionFinal": {
-    "recomendacion": "La recomendación u opción elegida de forma inequívoca y objetiva.",
-    "justificacion": "Explicación sólida del porqué basada en toda la evidencia recolectada.",
-    "nivelConfianza": 95,
-    "porqueConfianza": "Justificación explícita de por qué este nivel de confianza."
-  },
-  "planPasoAPaso": [
-    { "paso": 1, "titulo": "Título de la fase o paso", "descripcion": "Instrucciones detalladas de ejecución." }
-  ],
-  "erroresComunes": [
-    { "error": "Error típico que comete la gente en este asunto", "comoEvitarlo": "Pautas para evadir este error." }
-  ],
-  "listaVerificacion": [
-    "Elemento de checklist 1 para verificar que la decisión/acción va por buen camino",
-    "Elemento de checklist 2..."
-  ],
-  "resumenFinal": {
-    "queHacer": ["Acción clave recomendada"],
-    "queNoHacer": ["Acción prohibida o desaconsejada"],
-    "porque": "Breve explicación de la razón detrás de estas dos listas."
-  },
-  "esBiblico": false,
-  "especificosBiblicos": {
-    "contextoHistoricoBiblico": "Contexto histórico detallado del pasaje o doctrina.",
-    "contextoLiterario": "Contexto literario (género, estructura, flujo de pensamiento).",
-    "propositoAutor": "Propósito original del autor al escribir.",
-    "destinatarios": "A quiénes iba dirigido originalmente.",
-    "principioUniversal": "Principio espiritual o ético inmutable y universal.",
-    "aplicacionActual": "Cómo se aplica ese principio el día de hoy.",
-    "pasajesRelacionados": ["Libro Capítulo:Versículo - Explicación breve de la relación"],
-    "posiblesMalasInterpretaciones": [
-      { "interpretacion": "Interpretación errónea común (fuera de contexto)", "refutacion": "Refutación basada en exégesis." }
-    ],
-    "conclusionExegetica": "Conclusión formal exegética."
-  },
-  "esCientifico": false,
-  "especificosCientificos": {
-    "nivelEvidencia": "Nivel de evidencia (ej. Nivel Ia, Ib, IIa, etc. basados en tipo de estudios).",
-    "consensoCientifico": "Estado actual del consenso de la comunidad de científicos.",
-    "limitacionesCientificas": "Limitaciones de los estudios o teorías actuales.",
-    "estudiosContradictorios": ["Estudio/Autor/Año que presenta resultados contrarios o alternativos"],
-    "gradoCerteza": "Grado de certeza científica (ej. Alto, Moderado, Bajo) con justificación."
-  },
-  "auditoriaRazonamiento": {
-    "supuestosHechos": ["¿Qué supuestos implícitos o explícitos se hicieron al formular la conclusión?"],
-    "evidenciaContradictoria": ["¿Qué evidencia sólida, dato o pasaje contradice la conclusión recomendada?"],
-    "informacionFaltante": ["¿Qué información o datos adicionales faltarían para elevar el nivel de certeza?"],
-    "sesgosCognitivos": [
-      {
-        "sesgo": "Sesgo de confirmación / Sesgo de disponibilidad / Sesgo de autoridad / etc.",
-        "descripcion": "Definición breve del sesgo.",
-        "comoAfecta": "Cómo podría estar afectando este sesgo a esta decisión o análisis específico."
-      }
-    ],
-    "escenariosFalla": ["Escenario específico en el cual la recomendación propuesta dejaría de ser la mejor opción."],
-    "disparadoresCambio": ["Dato, evento o descubrimiento concreto que obligaría a cambiar la conclusión de inmediato."]
-  },
-  "testDiagnostico": {
-    "tituloTest": "Test Diagnóstico de Nivel de Conocimiento y Realidad Psicológica sobre [Tema]",
-    "descripcion": "Cuestionario de 4 a 5 preguntas para evaluar la precisión técnica y la disposición emocional/sesgos cognitivos del usuario respecto a este tema específico.",
-    "preguntas": [
-      {
-        "id": 1,
-        "pregunta": "Pregunta 1 evaluando comprensión de conceptos clave o datos duros del tema.",
-        "dimension": "conocimiento",
-        "opciones": [
-          {
-            "letra": "A",
-            "texto": "Opción que refleja falta de información o mitos comunes.",
-            "puntajeConocimiento": 5,
-            "puntajePsicologico": 10,
-            "explicacionEvaluativa": "Explica qué revela esta respuesta en cuanto a su nivel de conocimiento técnico."
-          },
-          {
-            "letra": "B",
-            "texto": "Opción con conocimiento parcial o superficial.",
-            "puntajeConocimiento": 15,
-            "puntajePsicologico": 15,
-            "explicacionEvaluativa": "Diagnóstico de conocimiento intermedio."
-          },
-          {
-            "letra": "C",
-            "texto": "Opción basada en datos precisos y comprensión avanzada.",
-            "puntajeConocimiento": 25,
-            "puntajePsicologico": 25,
-            "explicacionEvaluativa": "Excelente dominio conceptual del tema."
+      const job: AnalysisJobRecord = existing
+        ? {
+            ...existing,
+            topic: cleanTopic,
+            focusType: cleanFocus,
+            tradicionTeologica: cleanTradition,
+            completedStages: mergedStages,
+            partialData: mergedPartial,
+            currentStage: nextStage,
+            failedStage: null,
+            error: undefined,
+            status: nextStage ? "running" : "completed",
+            updatedAt: now,
           }
-        ]
+        : {
+            jobId,
+            status: nextStage ? "running" : "completed",
+            topic: cleanTopic,
+            focusType: cleanFocus,
+            tradicionTeologica: cleanTradition,
+            completedStages: mergedStages,
+            currentStage: nextStage,
+            failedStage: null,
+            partialData: mergedPartial,
+            createdAt: now,
+            updatedAt: now,
+          };
+
+      if (!nextStage) {
+        job.result = sanitizeAnalysisResponse(job.partialData);
       }
-    ],
-    "interpretacionConocimiento": {
-      "nivelAlto": "Interpretación para puntuaciones altas en conocimiento técnico.",
-      "nivelMedio": "Interpretación para puntuaciones intermedias.",
-      "nivelBajo": "Interpretación y recomendación para principiantes o conocimiento intuitivo."
-    },
-    "interpretacionPsicologica": {
-      "nivelMaduro": "Diagnóstico de alta estabilidad psicológica y objetividad.",
-      "nivelModerado": "Diagnóstico de disposición intermedia con sesgos controlables.",
-      "nivelVulnerable": "Diagnóstico de alta vulnerabilidad a sesgos emocionales, prisa o ansiedad."
+
+      persistJobCheckpoint(job);
+
+      if (job.status === "running" && getExecutionMode() === "background") {
+        void runJobStagesInBackground(job.jobId);
+        res.status(202).json(serializeJobState(job));
+        return;
+      }
+
+      res.status(200).json(serializeJobState(job));
+    } catch (error: any) {
+      res.status(500).json({ error: error?.message || "No se pudo iniciar el análisis." });
     }
-  },
-  "teologiaEvangelica": {
-    "evaluacionMotivosCorazon": {
-      "motivosSubyacentes": ["Deseos profundos, temores latentes, anhelos o intenciones que motivan esta consulta o decisión en el corazón humano según Santiago 4 y Proverbios."],
-      "posiblesIdolosCorazon": ["Identificar ídolos funcionales del corazón en juego en este tema, como control, comodidad, aprobación, poder, o seguridad."],
-      "consejoPastoralDeseos": "Breve exégesis de consejería bíblica para redireccionar y alinear esos deseos del corazón con Cristo Jesús (Proverbios 4:23)."
-    },
-    "impactoEclesiologicoPastoral": {
-      "servicioYComunidad": "Impacto del tema en la edificación, el servicio ministerial y la comunión de los santos en la iglesia local (Hebreos 10:24-25).",
-      "testimonioPublico": "Implicaciones para el testimonio cristiano público y la proclamación del Evangelio ante la sociedad (Mateo 5:16).",
-      "discipuladoYFamilia": "Efecto o pautas para el discipulado personal, la instrucción en santidad y la transmisión de la fe familiar."
-    },
-    "marcoRedentorCristocentrico": {
-      "creacion": "Cómo refleja este tema el diseño original, la bondad y el orden de Dios en la Creación.",
-      "caida": "De qué manera este asunto ha sido distorsionado, afectado o roto por el Pecado y la Caída del hombre.",
-      "redencion": "La obra redentora de Jesucristo, la cruz, la gracia salvadora y la capacitación del Espíritu Santo en este dilema.",
-      "consumacion": "La esperanza futura de la gloria final, la renovación de todas las cosas y el consuelo de la eternidad en la Consumación.",
-      "conexionEvangelio": "La síntesis teológica de cómo este asunto en particular se conecta y depende directamente del Evangelio de la Gracia de Jesucristo."
-    },
-    "concordanciaOriginal": [
-      {
-        "pasaje": "Cita bíblica clave relevante para el tema (ej. Romanos 12:1 o Proverbios 4:23).",
-        "palabrasOriginales": [
-          {
-            "palabra": "La palabra en su alfabeto original (Hebreo o Griego con sus caracteres correctos).",
-            "transliteracion": "La transliteración fonética de la palabra original.",
-            "idioma": "Hebreo o Griego",
-            "strong": "Número de Concordancia Strong (ej. G3563 o H3820).",
-            "traduccionLiteral": "Traducción literal palabra por palabra al español.",
-            "significadoTeologico": "Significado e implicancia teológico-exegética profunda de este término en este contexto."
-          }
-        ],
-        "contextoExegetico": "Análisis exegético breve del versículo completo en su idioma original y su sintaxis."
-      }
-    ]
-  }
-}
+  });
 
-REGLAS DE RIGOR Y PROFUNDIDAD OBLIGATORIA:
-- NUNCA inventes datos, cifras ficticias, citas bíblicas inexistentes o nombres de estudios científicos falsos. Si un dato empírico tiene incertidumbre o límites metodológicos, decláralo explícitamente.
-- DENSIDAD Y ABUNDANCIA RELEVANTE (SIN RELLENO): Desarrolla cada bloque con sustancia analítica real, mecanismos causales concretos, criterios verificables y ejemplos claros en lugar de frases genéricas breves:
-  * "resumenEjecutivo": 2 a 3 párrafos sustanciosos que sinteticen tesis, tensión central y veredicto.
-  * "comprensionProblema": Desglose profundo entre la pregunta superficial, el dilema subyacente, las restricciones reales y efectos de segundo orden.
-  * "definiciones": Incluye de 5 a 7 términos clave del dominio, cada uno con definición académica precisa Y una "explicacionSencilla" clara con analogía cotidiana.
-  * "contexto": Desarrolla cada uno de los 5 ejes ("historico", "cultural", "cientifico", "biblico", "practico") con 3 a 5 oraciones concretas y pertinentes al tema.
-  * "analisisMultidisciplinario": Incluye de 5 a 7 disciplinas verdaderamente relevantes al caso, explicando mecanismos, datos o principios concretos de cada campo.
-  * "perspectivas": Incluye de 3 a 4 corrientes o posturas reales bien diferenciadas, con al menos 3 fortalezas y 3 debilidades específicas en cada una.
-  * "matrizDecisiones": Incluye de 4 a 5 alternativas estratégicas realistas (incluyendo opción conservadora/status quo u opción híbrida), con al menos 3 pros y 3 contras claros, y todos los atributos evaluados.
-  * "riesgos": Incluye de 4 a 5 riesgos concretos con su estrategia de prevención y solución de contingencia accionable.
-  * "planPasoAPaso": Incluye de 5 a 7 fases secuenciales detalladas y accionables.
-  * "accionesPracticas": Al menos 3 acciones medibles por cada horizonte temporal ("inmediatas", "estaSemana", "esteMes", "largoPlazo").
-  * "erroresComunes": Incluye de 4 a 5 errores frecuentes con explicación clara de cómo evitarlos.
-  * "listaVerificacion": Incluye de 6 a 8 criterios concretos de verificación.
-  * "auditoriaRazonamiento": Incluye 3 a 4 supuestos, 3 a 4 evidencias contradictorias, 3 a 4 datos faltantes, 3 a 4 sesgos cognitivos analizados en profundidad, 3 escenarios de falla y 3 disparadores de cambio.
-  * "testDiagnostico": Incluye 5 a 6 preguntas diagnósticas precisas con 4 opciones graduadas ("A" a "D") cada una.
-- REGLA ESTRICTA PARA URLs EN "recursosRecomendados": Incluye de 2 a 4 recursos reales por categoría pertinente. Incluye el campo "url" únicamente con enlaces "https://" reales, oficiales y conocidos con certeza (portales oficiales, herramientas, software, DOI reales o plataformas educativas reconocidas). NUNCA inventes rutas largas o URLs ficticias; si no conoces la URL exacta con certeza, deja "url": "" para que el servidor o buscador genere el enlace verificado correspondiente.
-- Si el usuario eligió un enfoque específico (ej. Bíblico, Científico, Toma de Decisiones), asegúrate de que esa sección esté sumamente desarrollada, pero completa TODO el esquema con rigor y exactitud.
-`;
+  // Poll current job checkpoint status
+  app.get("/api/analyze/jobs/:jobId", pollQuotaGuard, (req: Request, res: Response) => {
+    const jobId = req.params.jobId;
+    if (!isValidUuid(jobId)) {
+      res.status(400).json({ error: "Identificador de análisis inválido." });
+      return;
+    }
 
-      const isSabiduriaPractica =
-        selectedTradition === "Sabiduría práctica y habilidades sociales" ||
-        selectedTradition.toLowerCase().includes("sabiduría práctica") ||
-        selectedTradition.toLowerCase().includes("habilidades sociales");
+    const job = loadJobCheckpoint(jobId);
+    if (!job) {
+      res.status(404).json({ error: "Trabajo de análisis no encontrado o expirado." });
+      return;
+    }
 
-      const sabiduriaPracticaPrompt = isSabiduriaPractica
-        ? `
-MARCO OBLIGATORIO ACTIVO: "Sabiduría práctica y habilidades sociales".
-El usuario ha seleccionado explícitamente el marco de "Sabiduría práctica y habilidades sociales". DEBES AJUSTAR FIELMENTE todo el análisis, las decisiones y las recomendaciones a estas capacidades:
-1. Sabiduría Práctica Aplicada (Phrónēsis / Prudencia Operativa):
-   - Cada consejo y análisis debe aterrizar en la realidad cotidiana y en el sentido común más refinado, descartando dogmatismos abstractos o teorías académicas desconectadas del mundo real.
-   - Ponderar el "timing" oportuno (cuándo actuar, cuándo esperar, cuándo guardar silencio), la sobriedad emocional y la anticipación de consecuencias de segundo y tercer orden.
-2. Inteligencia Interpersonal y Habilidades Sociales Avanzadas:
-   - Comunicación Asertiva: Proveer guías y tácticas concretas de cómo expresar posturas con firmeza pero sin agresividad, cuidando el tono, el lenguaje corporal y la elección exacta de palabras.
-   - Empatía y Calibración: Analizar la perspectiva, motivaciones ocultas, miedos y necesidades de los otros involucrados (lectura de dinámicas de poder, estados de ánimo y tensiones relacionales).
-   - Manejo de Conflictos y Negociación Ganar-Ganar: Proponer soluciones diplomáticas que construyan puentes, reduzcan la fricción social, eviten herir susceptibilidades y conviertan opositores en colaboradores.
-   - Establecimiento de Límites Saludables: Enseñar cómo decir "no" con elegancia y respeto, cómo proteger la propia integridad sin generar rupturas innecesarias.
-3. Desglose en las Secciones del Esquema JSON:
-   - "resumenEjecutivo" y "comprensionProblema": Enfatizar la dimensión humana, relacional y pragmática del asunto.
-   - "analisisMultidisciplinario": Debe incluir obligatoriamente disciplinas como "Psicología Social y Relacional", "Habilidades de Comunicación y Asertividad", "Pragmatismo Conductual y Negociación", y "Ética Interpersonal".
-   - "accionesPracticas" y "planPasoAPaso": Cada paso debe incluir una instrucción clara sobre cómo gestionarlo con las personas involucradas (qué decir, cómo comunicarlo, a quién consultar o cómo mitigar resistencias).
-   - "erroresComunes": Centrarse en errores típicos de ego, reactividad impulsiva, hablar de más, falta de tacto social, soberbia intelectual o pasivo-agresividad.
-   - "matrizDecisiones": Evaluar el impacto en las relaciones interpersonales, capital social, reputación y bienestar emocional.
-   - "testDiagnostico" y "simuladorEscenarios": Las preguntas y escenarios deben evaluar directamente el nivel de prudencia práctica, madurez emocional, asertividad y tacto social ante situaciones tensas.
-`
-        : "";
+    res.json(serializeJobState(job));
+  });
 
-      const userPrompt = `Realiza un análisis integral, objetivo y riguroso para la siguiente consulta:
-Tema de consulta: "${topic}"
-Categoría / Enfoque solicitado: "${focusType}"
-Marco de Referencia Adicional: "${selectedTradition}"
-${sabiduriaPracticaPrompt}
-
-Instrucciones de adaptación objetiva:
-1. Determina autónomamente la naturaleza del tema. Si es predominantemente científico/técnico ("esCientifico": true), si es bíblico/teológico ("esBiblico": true), o si abarca ambas/múltiples dimensiones.
-2. Mantén la mayor objetividad metodológica según la materia de que se trate.
-3. Si el Marco de Referencia Adicional es "Sabiduría práctica y habilidades sociales", ajusta todo el reporte fielmente a las capacidades de prudencia cotidiana, asertividad comunicacional, inteligencia relacional, negociación ganar-ganar y resolución pacífica de conflictos.
-4. Si el tema o enfoque no es bíblico/teológico, enfoca la mayor sustancia analítica en los datos, lógica, finanzas, ciencia y práctica. Para los campos teológicos o bíblicos, complétalos de manera prudente, respetuosa y neutral enfocándolos en valores éticos universales sin forzar dogmas religiosos sobre asuntos puramente seculares.
-5. Si el tema es de naturaleza teológica o el enfoque es Bíblico/Teológico, desarrolla a plenitud la exégesis de idiomas originales, la tradición confesional indicada ("${selectedTradition}") y la consejería de vida.`;
-
-      const groundedSourcesPromise = fetchGroundedSourcesForTopic(ai, topic).catch(() => [] as GroundedWebSource[]);
-
-      const { response } = await generateContentWithRetryAndFallback(
-        ai,
-        "gemini-3.1-flash-lite",
-        "gemini-4-hydrogen",
-        userPrompt,
-        systemInstruction
-      );
-
-      let text = response.text;
-      if (!text) {
-        throw new Error("No se pudo obtener una respuesta del modelo.");
+  // Resume an interrupted/paused job (rehydrating from client checkpoint if server restarted)
+  app.post("/api/analyze/jobs/:jobId/resume", requireAuth, (req: Request, res: Response) => {
+    try {
+      const jobId = req.params.jobId;
+      if (!isValidUuid(jobId)) {
+        res.status(400).json({ error: "Identificador de análisis inválido." });
+        return;
       }
 
-      text = text.trim();
-      if (text.startsWith("```")) {
-        text = text.replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/, "").trim();
-      }
+      const {
+        topic,
+        focusType,
+        tradicionTeologica,
+        completedStages: rawCompleted,
+        partialData: rawPartial,
+      } = req.body || {};
 
-      let parsedData;
-      try {
-        parsedData = JSON.parse(text);
-      } catch {
-        const firstBrace = text.indexOf("{");
-        const lastBrace = text.lastIndexOf("}");
-        if (firstBrace !== -1 && lastBrace > firstBrace) {
-          try {
-            parsedData = JSON.parse(text.slice(firstBrace, lastBrace + 1));
-          } catch {
-            parsedData = null;
-          }
-        }
-        if (!parsedData) {
-          console.warn("Aviso: Formato JSON no estándar recibido:", text?.slice(0, 100));
-          res.status(500).json({
-            error: "El modelo generó un formato no estándar. Pulsa 'Reintentar ahora'.",
-          });
+      let job = loadJobCheckpoint(jobId);
+      const clientStages = filterValidStageIds(rawCompleted);
+      const clientPartial = pickSafePartialAnalysisData(rawPartial);
+
+      if (!job) {
+        if (!topic || typeof topic !== "string" || !topic.trim()) {
+          res.status(404).json({ error: "No se encontró el análisis previo ni los datos para reanudarlo." });
           return;
         }
+        const now = Date.now();
+        job = {
+          jobId,
+          status: "running",
+          topic: topic.trim().slice(0, 4000),
+          focusType:
+            typeof focusType === "string" && focusType.trim() ? focusType.trim().slice(0, 200) : "General",
+          tradicionTeologica:
+            typeof tradicionTeologica === "string" && tradicionTeologica.trim()
+              ? tradicionTeologica.trim().slice(0, 200)
+              : "General / Neutral (Sin Sesgo)",
+          completedStages: clientStages,
+          currentStage: getNextPendingStage(clientStages),
+          failedStage: null,
+          partialData: clientPartial,
+          createdAt: now,
+          updatedAt: now,
+        };
+      } else {
+        // Merge any newer client checkpoint stages cleanly
+        const mergedStages = filterValidStageIds([...job.completedStages, ...clientStages]);
+        job.completedStages = mergedStages;
+        job.partialData = { ...clientPartial, ...job.partialData };
+        job.failedStage = null;
+        job.error = undefined;
+        job.retryable = true;
       }
 
-      const sanitizedData = sanitizeAnalysisResponse(parsedData);
-      const groundedSources = await Promise.race([
-        groundedSourcesPromise,
-        new Promise<GroundedWebSource[]>((resolve) => setTimeout(() => resolve([]), 1500)),
-      ]);
-      sanitizedData.recursosRecomendados = await enrichAndVerifyRecommendedResources(
-        sanitizedData.recursosRecomendados,
-        groundedSources
-      );
+      const nextStage = getNextPendingStage(job.completedStages);
+      if (!nextStage) {
+        finalizeJobIfComplete(job);
+        res.status(200).json(serializeJobState(job));
+        return;
+      }
+
+      job.status = "running";
+      job.currentStage = nextStage;
+      job.updatedAt = Date.now();
+      persistJobCheckpoint(job);
+
+      if (getExecutionMode() === "background") {
+        void runJobStagesInBackground(job.jobId);
+        res.status(202).json(serializeJobState(job));
+        return;
+      }
+
+      res.status(200).json(serializeJobState(job));
+    } catch (error: any) {
+      res.status(500).json({ error: error?.message || "No se pudo reanudar el análisis." });
+    }
+  });
+
+  // Execute a single checkpointed stage synchronously (for step-by-step / Vercel serverless mode)
+  app.post("/api/analyze/stage", requireAuth, async (req: Request, res: Response) => {
+    try {
+      const {
+        jobId: requestedJobId,
+        stage,
+        topic,
+        focusType,
+        tradicionTeologica,
+        completedStages: rawCompleted,
+        partialData: rawPartial,
+      } = req.body || {};
+
+      if (typeof stage !== "string" || !ANALYSIS_STAGE_ORDER.includes(stage as AnalysisStageId)) {
+        res.status(400).json({ error: "Etapa de análisis inválida." });
+        return;
+      }
+      if (!topic || typeof topic !== "string" || !topic.trim()) {
+        res.status(400).json({ error: "El tema de consulta es requerido." });
+        return;
+      }
+
+      const stageId = stage as AnalysisStageId;
+      const cleanTopic = topic.trim().slice(0, 4000);
+      const cleanFocus =
+        typeof focusType === "string" && focusType.trim() ? focusType.trim().slice(0, 200) : "General";
+      const cleanTradition =
+        typeof tradicionTeologica === "string" && tradicionTeologica.trim()
+          ? tradicionTeologica.trim().slice(0, 200)
+          : "General / Neutral (Sin Sesgo)";
+
+      const jobId = isValidUuid(requestedJobId) ? requestedJobId : crypto.randomUUID();
+      const existing = loadJobCheckpoint(jobId);
+
+      const clientStages = filterValidStageIds(rawCompleted);
+      const clientPartial = pickSafePartialAnalysisData(rawPartial);
+      const basePartial = { ...clientPartial, ...(existing?.partialData || {}) };
+      const baseStages = filterValidStageIds([...clientStages, ...(existing?.completedStages || [])]);
+
+      // If stage already completed in existing checkpoint, return immediately without re-billing AI
+      if (existing && existing.completedStages.includes(stageId)) {
+        finalizeJobIfComplete(existing);
+        res.json(serializeJobState(existing));
+        return;
+      }
+
+      const ai = getGeminiClient();
+      const stageData = await executeSingleStage(ai, stageId, {
+        topic: cleanTopic,
+        focusType: cleanFocus,
+        tradicionTeologica: cleanTradition,
+        partialData: basePartial,
+      });
+
+      const mergedPartial = {
+        ...basePartial,
+        ...stageData,
+      };
+      const mergedStages = filterValidStageIds([...baseStages, stageId]);
+      const now = Date.now();
+
+      const updatedJob: AnalysisJobRecord = existing
+        ? {
+            ...existing,
+            topic: cleanTopic,
+            focusType: cleanFocus,
+            tradicionTeologica: cleanTradition,
+            completedStages: mergedStages,
+            partialData: mergedPartial,
+            failedStage: null,
+            error: undefined,
+            updatedAt: now,
+          }
+        : {
+            jobId,
+            status: "running",
+            topic: cleanTopic,
+            focusType: cleanFocus,
+            tradicionTeologica: cleanTradition,
+            completedStages: mergedStages,
+            currentStage: getNextPendingStage(mergedStages),
+            failedStage: null,
+            partialData: mergedPartial,
+            createdAt: now,
+            updatedAt: now,
+          };
+
+      const isDone = finalizeJobIfComplete(updatedJob);
+      if (!isDone) {
+        updatedJob.status = "running";
+        persistJobCheckpoint(updatedJob);
+      }
+
+      res.json(serializeJobState(updatedJob));
+    } catch (error: any) {
+      const is503 =
+        error?.message?.includes("503") ||
+        error?.message?.includes("saturación") ||
+        error?.message?.includes("alta demanda");
+      res.status(is503 ? 503 : 500).json({
+        error: error?.message || "Ocurrió un error al ejecutar esta etapa del análisis.",
+        retryable: error?.retryable !== false,
+      });
+    }
+  });
+
+  // Backwards-compatible synchronous comprehensive analysis (now powered by the 4-stage pipeline)
+  app.post("/api/analyze", requireAuth, async (req: Request, res: Response) => {
+    try {
+      const { topic, focusType, tradicionTeologica } = req.body || {};
+
+      if (!topic || typeof topic !== "string" || !topic.trim()) {
+        res.status(400).json({ error: "El tema de consulta es requerido." });
+        return;
+      }
+
+      const cleanTopic = topic.trim().slice(0, 4000);
+      const cleanFocus =
+        typeof focusType === "string" && focusType.trim() ? focusType.trim().slice(0, 200) : "General";
+      const selectedTradition =
+        typeof tradicionTeologica === "string" && tradicionTeologica.trim()
+          ? tradicionTeologica.trim().slice(0, 200)
+          : "General / Neutral (Sin Sesgo)";
+
+      const ai = getGeminiClient();
+      let accumulated: Record<string, any> = {};
+
+      for (const stage of ANALYSIS_STAGE_ORDER) {
+        const stageData = await executeSingleStage(ai, stage, {
+          topic: cleanTopic,
+          focusType: cleanFocus,
+          tradicionTeologica: selectedTradition,
+          partialData: accumulated,
+        });
+        accumulated = { ...accumulated, ...stageData };
+      }
+
+      const sanitizedData = sanitizeAnalysisResponse(accumulated);
       res.json(sanitizedData);
     } catch (error: any) {
-      const is503 = error.message?.includes("503") || error.message?.includes("alta demanda");
-      res.status(is503 ? 503 : 500).json({ error: error.message || "Ocurrió un error inesperado al analizar." });
+      const is503 =
+        error?.message?.includes("503") ||
+        error?.message?.includes("saturación") ||
+        error?.message?.includes("alta demanda");
+      res.status(is503 ? 503 : 500).json({
+        error: error?.message || "Ocurrió un error inesperado al analizar.",
+      });
     }
   });
 
   // REST API for inline dictionary lookup
   app.post("/api/define", requireAuth, async (req: Request, res: Response) => {
     try {
-      const { term, context } = req.body;
+      const { term, context } = req.body || {};
 
       if (!term || typeof term !== "string" || !term.trim()) {
         res.status(400).json({ error: "El término a definir es requerido." });
@@ -872,48 +1486,28 @@ Debes responder ÚNICAMENTE en formato JSON válido con esta estructura estricta
 `;
 
       const userPrompt = `Define el siguiente término o expresión seleccionada: "${cleanTerm}".
-Contexto cercano del texto donde apareció: "${(context || "").slice(0, 300)}"`;
+Contexto cercano del texto donde apareció: "${(typeof context === "string" ? context : "").slice(0, 300)}"`;
 
-      const { response } = await generateContentWithRetryAndFallback(
+      const { parsedJson } = await generateContentWithRetryAndFallback(
         ai,
         "gemini-3.1-flash-lite",
         "gemini-4-hydrogen",
         userPrompt,
-        systemInstruction
+        systemInstruction,
+        { stageLabel: "Diccionario" }
       );
 
-      let text = response.text;
-      if (!text) {
-        throw new Error("No se obtuvo respuesta del diccionario.");
+      if (!parsedJson) {
+        res.status(500).json({ error: "El diccionario devolvió un formato no estándar. Intenta de nuevo." });
+        return;
       }
-
-      text = text.trim();
-      if (text.startsWith("```")) {
-        text = text.replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/, "").trim();
-      }
-
-      let parsedData;
-      try {
-        parsedData = JSON.parse(text);
-      } catch {
-        const firstBrace = text.indexOf("{");
-        const lastBrace = text.lastIndexOf("}");
-        if (firstBrace !== -1 && lastBrace > firstBrace) {
-          try {
-            parsedData = JSON.parse(text.slice(firstBrace, lastBrace + 1));
-          } catch {
-            parsedData = null;
-          }
-        }
-        if (!parsedData) {
-          res.status(500).json({ error: "El diccionario devolvió un formato no estándar. Intenta de nuevo." });
-          return;
-        }
-      }
-      res.json(parsedData);
+      res.json(parsedJson);
     } catch (error: any) {
-      const is503 = error.message?.includes("503") || error.message?.includes("alta demanda");
-      res.status(is503 ? 503 : 500).json({ error: error.message || "Error al consultar el diccionario." });
+      const is503 =
+        error?.message?.includes("503") ||
+        error?.message?.includes("saturación") ||
+        error?.message?.includes("alta demanda");
+      res.status(is503 ? 503 : 500).json({ error: error?.message || "Error al consultar el diccionario." });
     }
   });
 
