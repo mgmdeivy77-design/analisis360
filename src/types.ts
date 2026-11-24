@@ -275,7 +275,14 @@ export interface DictionaryDefinitionResponse {
   categoria: string;
 }
 
-export type AnalysisStageId = "base" | "investigacion" | "decision" | "validacion";
+export type AnalysisStageId =
+  | "sintesis"
+  | "fundamentos"
+  | "investigacion"
+  | "decision"
+  | "accion"
+  | "auditoria"
+  | "recursos";
 
 export interface AnalysisStageMeta {
   id: AnalysisStageId;

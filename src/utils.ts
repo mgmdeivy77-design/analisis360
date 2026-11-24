@@ -967,36 +967,57 @@ export function generateMarkdownReport(rawAnalysis: ComprehensiveAnalysisRespons
 
 export const ANALYSIS_STAGES: AnalysisStageMeta[] = [
   {
-    id: "base",
+    id: "sintesis",
     order: 1,
-    title: "Comprensión, Síntesis y Contexto 5D",
-    subtitle: "Resumen ejecutivo, problema central, glosario dual y contexto multidisciplinario.",
+    title: "Comprensión y Síntesis",
+    subtitle: "Resumen ejecutivo, dilema central y tesis principal.",
+  },
+  {
+    id: "fundamentos",
+    order: 2,
+    title: "Glosario y Contexto 5D",
+    subtitle: "Definiciones duales y ejes histórico, cultural, científico, ético y práctico.",
   },
   {
     id: "investigacion",
-    order: 2,
+    order: 3,
     title: "Investigación y Perspectivas",
-    subtitle: "Análisis por disciplinas, contraste de posturas, evidencia y módulos especializados.",
+    subtitle: "Disciplinas, posturas contrastadas, comparación y módulos clave.",
   },
   {
     id: "decision",
-    order: 3,
-    title: "Matriz, Riesgos y Plan de Acción",
-    subtitle: "Alternativas estratégicas, recomendación, riesgos, pasos y checklist.",
+    order: 4,
+    title: "Matriz, Veredicto y Riesgos",
+    subtitle: "Alternativas evaluadas, recomendación final y mitigación de riesgos.",
   },
   {
-    id: "validacion",
-    order: 4,
-    title: "Auditoría, Test y Recursos",
-    subtitle: "Auto-auditoría de sesgos, test diagnóstico, discernimiento y enlaces verificados.",
+    id: "accion",
+    order: 5,
+    title: "Plan y Checklist",
+    subtitle: "Plan paso a paso, acciones por horizonte y errores comunes.",
+  },
+  {
+    id: "auditoria",
+    order: 6,
+    title: "Auditoría y Test",
+    subtitle: "Auto-refutación, sesgos cognitivos y test diagnóstico interactivo.",
+  },
+  {
+    id: "recursos",
+    order: 7,
+    title: "Discernimiento y Recursos",
+    subtitle: "Reflexión profunda, concordancia y biblioteca de enlaces verificados.",
   },
 ];
 
 export const ANALYSIS_STAGE_ORDER: AnalysisStageId[] = [
-  "base",
+  "sintesis",
+  "fundamentos",
   "investigacion",
   "decision",
-  "validacion",
+  "accion",
+  "auditoria",
+  "recursos",
 ];
 
 const ALLOWED_PARTIAL_ANALYSIS_KEYS = new Set<string>([

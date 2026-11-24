@@ -312,10 +312,11 @@ async function generateContentWithRetryAndFallback(
   };
 
   const modelsToTry = Array.from(
-    new Set([primaryModel, fallbackModel, "gemini-3.1-flash-lite", "gemini-4-hydrogen"])
+    new Set([primaryModel, fallbackModel, "gemini-4-hydrogen", "gemini-3.1-flash-lite"])
   );
   let lastError: any = null;
   let anyTransient = false;
+  let anyTimeout = false;
   const trace: ModelAttemptTrace[] = [];
   const labelPrefix = options?.stageLabel ? `[${options.stageLabel}] ` : "";
 
@@ -326,19 +327,30 @@ async function generateContentWithRetryAndFallback(
 
     for (let attempt = 1; attempt <= maxAttemptsForModel; attempt++) {
       const startedAt = Date.now();
-      const timeoutMs = i === 0 ? 42000 : 34000;
+      const firstChunkTimeoutMs = i === 0 ? 11500 : 10500;
+      const stallTimeoutMs = 9000;
+      const hardCapMs = i === 0 ? 22000 : 20000;
       const controller = new AbortController();
-      let timer: ReturnType<typeof setTimeout> | undefined;
+      let inactivityTimer: ReturnType<typeof setTimeout> | undefined;
+      let hardCapTimer: ReturnType<typeof setTimeout> | undefined;
+      let timeoutReason = "";
+
+      const resetInactivityTimer = (msLimit: number) => {
+        if (inactivityTimer) clearTimeout(inactivityTimer);
+        inactivityTimer = setTimeout(() => {
+          timeoutReason = `Timeout de respuesta en ${currentModel} tras ${Math.round((Date.now() - startedAt) / 1000)}s`;
+          controller.abort();
+        }, msLimit);
+      };
 
       try {
-        console.log(`[Gemini API] ${labelPrefix}Conectando con ${currentModel} (intento ${attempt}/${maxAttemptsForModel})...`);
+        console.log(`[Gemini API] ${labelPrefix}Streaming con ${currentModel} (intento ${attempt}/${maxAttemptsForModel})...`);
 
-        const timeoutPromise = new Promise<never>((_, reject) => {
-          timer = setTimeout(() => {
-            controller.abort();
-            reject(new Error(`Timeout de respuesta en ${currentModel} tras ${timeoutMs / 1000}s`));
-          }, timeoutMs);
-        });
+        hardCapTimer = setTimeout(() => {
+          timeoutReason = `Tiempo límite de etapa alcanzado en ${currentModel} (${hardCapMs / 1000}s)`;
+          controller.abort();
+        }, hardCapMs);
+        resetInactivityTimer(firstChunkTimeoutMs);
 
         const config: Record<string, any> = {
           abortSignal: controller.signal,
@@ -346,17 +358,36 @@ async function generateContentWithRetryAndFallback(
           responseMimeType: "application/json",
         };
         if (useThinking) {
-          config.thinkingConfig = { thinkingLevel: ThinkingLevel.LOW };
+          config.thinkingConfig = {
+            thinkingLevel:
+              currentModel === "gemini-3.1-flash-lite"
+                ? ThinkingLevel.MINIMAL
+                : ThinkingLevel.LOW,
+          };
         }
 
-        const generatePromise = ai.models.generateContent({
+        const stream = await ai.models.generateContentStream({
           model: currentModel,
           contents: userPrompt,
           config,
         });
 
-        const response = await Promise.race([generatePromise, timeoutPromise]);
-        const responseText = response?.text;
+        let responseText = "";
+        for await (const chunk of stream) {
+          if (controller.signal.aborted) {
+            throw new Error(timeoutReason || `Timeout de respuesta en ${currentModel}`);
+          }
+          const part = chunk?.text || "";
+          if (part) {
+            responseText += part;
+            resetInactivityTimer(stallTimeoutMs);
+          }
+        }
+
+        if (controller.signal.aborted && !responseText.trim()) {
+          throw new Error(timeoutReason || `Timeout de respuesta en ${currentModel}`);
+        }
+
         const ms = Date.now() - startedAt;
 
         if (!responseText || !responseText.trim()) {
@@ -370,16 +401,18 @@ async function generateContentWithRetryAndFallback(
 
         console.log(`[Gemini API] ${labelPrefix}Completado con ${currentModel} en ${ms}ms`);
         trace.push({ model: currentModel, ms, ok: true });
-        return { response, parsedJson, modelUsed: currentModel, trace };
+        return { response: { text: responseText }, parsedJson, modelUsed: currentModel, trace };
       } catch (error: any) {
         const ms = Date.now() - startedAt;
-        const errMsg = String(error?.message || "error").slice(0, 200);
+        const effectiveMsg = timeoutReason || String(error?.message || "error");
+        const errMsg = effectiveMsg.slice(0, 200);
         trace.push({ model: currentModel, ms, ok: false, error: errMsg });
-        lastError = error;
-        const isTransient = checkIsTransient(error);
-        if (isTransient) {
-          anyTransient = true;
-        }
+        lastError = timeoutReason ? new Error(timeoutReason) : error;
+        const isTransient = checkIsTransient(lastError);
+        const isTimedOut = Boolean(timeoutReason) || errMsg.toLowerCase().includes("timeout") || errMsg.toLowerCase().includes("aborted");
+        if (isTransient) anyTransient = true;
+        if (isTimedOut) anyTimeout = true;
+
         console.log(`[Gemini API] ${labelPrefix}Error en ${currentModel} (${ms}ms): ${errMsg}`);
 
         if (useThinking && errMsg.toLowerCase().includes("thinking")) {
@@ -387,23 +420,26 @@ async function generateContentWithRetryAndFallback(
           if (attempt < maxAttemptsForModel) continue;
         }
 
-        if (attempt < maxAttemptsForModel && isTransient) {
-          const jitter = Math.floor(Math.random() * 450);
-          const backoffMs = attempt * 950 + jitter;
-          await new Promise((r) => setTimeout(r, backoffMs));
+        // Retry same model ONLY if failure was fast (< 2.5s) and transient; if timed out, move straight to fallback model
+        if (attempt < maxAttemptsForModel && isTransient && !isTimedOut && ms < 2500) {
+          const jitter = Math.floor(Math.random() * 300);
+          await new Promise((r) => setTimeout(r, 450 + jitter));
           continue;
         }
         break;
       } finally {
-        if (timer) clearTimeout(timer);
+        if (inactivityTimer) clearTimeout(inactivityTimer);
+        if (hardCapTimer) clearTimeout(hardCapTimer);
       }
     }
   }
 
   const isHighDemand = anyTransient || checkIsTransient(lastError);
   const err: any = new Error(
-    isHighDemand
-      ? "El servicio de análisis experimentó una saturación o intermitencia temporal (503/Timeout). Tu progreso previo quedó guardado para continuar desde este punto."
+    anyTimeout
+      ? "El motor de IA tardó más de lo esperado en responder en esta etapa. Tu avance previo quedó guardado; pulsa 'Continuar' para retomar desde aquí."
+      : isHighDemand
+      ? "Los servidores de IA están experimentando alta demanda temporal (503). Tu avance previo quedó guardado para continuar sin perder nada."
       : `No fue posible completar esta etapa con el motor de IA. Detalle: ${lastError?.message || "Servicio no disponible"}`
   );
   err.trace = trace;
@@ -483,11 +519,11 @@ async function fetchGroundedSourcesForTopic(
   topic: string
 ): Promise<GroundedWebSource[]> {
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), 8000);
+  const timer = setTimeout(() => controller.abort(), 4500);
   try {
     const genPromise = ai.models.generateContent({
-      model: "gemini-3.1-flash-lite",
-      contents: `Encuentra los mejores sitios web oficiales, artículos de referencia, cursos o herramientas confiables en línea sobre: "${topic.slice(0, 220)}"`,
+      model: "gemini-4-hydrogen",
+      contents: `Encuentra los mejores sitios web oficiales, artículos de referencia, cursos o herramientas confiables en línea sobre: "${topic.slice(0, 200)}"`,
       config: {
         abortSignal: controller.signal,
         tools: [{ googleSearch: {} }],
@@ -677,37 +713,44 @@ Marco de Referencia Adicional: "${selectedTradition}"
 ${buildStageDigest(partialData)}`;
 
   switch (stage) {
-    case "base":
+    case "sintesis":
       return `${header}
-TAREA — ETAPA 1 DE 4 (Comprensión, Síntesis, Glosario y Contexto 5D):
+TAREA — ETAPA 1 DE 7 (Comprensión y Síntesis Central):
 Genera ÚNICAMENTE un JSON válido con estos campos exactos:
 {
-  "resumenEjecutivo": "2 a 3 párrafos sustanciosos que sinteticen tesis, tensión central y veredicto preliminar.",
-  "comprensionProblema": "Desglose profundo entre la pregunta superficial, el dilema subyacente, restricciones reales y efectos de segundo orden.",
+  "resumenEjecutivo": "2 párrafos claros y sustanciosos que sinteticen tesis, tensión central y veredicto preliminar.",
+  "comprensionProblema": "Desglose preciso entre la pregunta superficial, el dilema subyacente, restricciones reales y efectos de segundo orden.",
   "sintesisClave": {
-    "deQueTrata": "Respuesta clara y directa a ¿De qué trata?",
+    "deQueTrata": "Respuesta directa a ¿De qué trata?",
     "ideaPrincipal": "Tesis o idea fundamental.",
     "argumentos": ["Argumento clave 1", "Argumento clave 2", "Argumento clave 3"],
     "conclusion": "Conclusión sintética clara."
   },
-  "definiciones": [
-    {
-      "termino": "Término clave (incluye 5 a 7 términos relevantes)",
-      "definicion": "Explicación académica o técnica precisa.",
-      "explicacionSencilla": "Explicación cotidiana sencilla estilo principiante con analogía clara (SIN repetir el texto técnico)."
-    }
-  ],
-  "contexto": {
-    "historico": "3 a 5 oraciones concretas sobre el contexto histórico.",
-    "cultural": "3 a 5 oraciones concretas sobre el contexto cultural/social.",
-    "cientifico": "3 a 5 oraciones concretas sobre la base científica o empírica.",
-    "biblico": "3 a 5 oraciones prudentes y objetivas sobre el ángulo ético o bíblico.",
-    "practico": "3 a 5 oraciones sobre la aplicación práctica cotidiana."
-  },
   "esBiblico": false,
   "esCientifico": false
 }
-Regla: Determina con precisión si "esBiblico" o "esCientifico" deben ser true o false según la materia real de la consulta y el enfoque solicitado.`;
+Regla: Ajusta "esBiblico" y "esCientifico" a true o false según la naturaleza real del tema y enfoque.`;
+
+    case "fundamentos":
+      return `${header}
+TAREA — ETAPA 2 DE 7 (Glosario Dual y Contexto 5D):
+Genera ÚNICAMENTE un JSON válido con estos campos exactos:
+{
+  "definiciones": [
+    {
+      "termino": "Término clave (4 a 5 términos relevantes)",
+      "definicion": "Explicación académica o técnica precisa.",
+      "explicacionSencilla": "Explicación sencilla cotidiana con analogía clara (SIN repetir el texto técnico)."
+    }
+  ],
+  "contexto": {
+    "historico": "2 a 4 oraciones concretas sobre el contexto histórico.",
+    "cultural": "2 a 4 oraciones concretas sobre el contexto cultural/social.",
+    "cientifico": "2 a 4 oraciones concretas sobre la base científica o empírica.",
+    "biblico": "2 a 4 oraciones prudentes y objetivas sobre el ángulo ético o bíblico.",
+    "practico": "2 a 4 oraciones sobre la aplicación práctica cotidiana."
+  }
+}`;
 
     case "investigacion": {
       const wantBiblical =
@@ -720,46 +763,46 @@ Regla: Determina con precisión si "esBiblico" o "esCientifico" deben ser true o
         focusType.toLowerCase().includes("salud");
 
       return `${header}
-TAREA — ETAPA 2 DE 4 (Investigación Multidisciplinaria, Perspectivas y Comparación):
+TAREA — ETAPA 3 DE 7 (Investigación Multidisciplinaria, Perspectivas y Evidencia):
 Genera ÚNICAMENTE un JSON válido con estos campos exactos:
 {
   "analisisMultidisciplinario": [
     {
-      "disciplina": "Nombre de disciplina (incluye 5 a 7 disciplinas verdaderamente relevantes)",
-      "analisis": "Análisis profundo con mecanismos, datos o principios concretos.",
+      "disciplina": "Nombre de disciplina (4 a 6 disciplinas clave)",
+      "analisis": "Análisis claro con mecanismos, datos o principios concretos.",
       "relevancia": "Alta | Media | Baja"
     }
   ],
   "perspectivas": [
     {
-      "nombre": "Postura o corriente real diferenciada (incluye 3 a 4 perspectivas)",
+      "nombre": "Postura o corriente diferenciada (3 perspectivas)",
       "fortalezas": ["Fortaleza específica 1", "Fortaleza 2", "Fortaleza 3"],
       "debilidades": ["Debilidad específica 1", "Debilidad 2", "Debilidad 3"]
     }
   ],
   "comparacionObjetiva": {
-    "evidencia": "Comparación rigurosa de la solidez empírica entre posturas.",
-    "coherenciaLogica": "Análisis de consistencia lógica interna.",
-    "resultadosObservables": "Resultados verificables en la realidad práctica.",
+    "evidencia": "Solidez empírica comparada entre posturas.",
+    "coherenciaLogica": "Consistencia lógica interna.",
+    "resultadosObservables": "Resultados verificables en la práctica.",
     "compatibilidadBiblica": "Alineación o tensión con principios éticos y bíblicos.",
-    "riesgos": "Comparación directa de riesgos por postura.",
+    "riesgos": "Comparación de riesgos por postura.",
     "beneficios": "Comparación de beneficios esperados.",
     "limitaciones": "Limitaciones metodológicas o de alcance."
   }${
     wantBiblical
       ? `,
   "especificosBiblicos": {
-    "contextoHistoricoBiblico": "Contexto histórico detallado.",
-    "contextoLiterario": "Género, estructura y flujo de pensamiento.",
+    "contextoHistoricoBiblico": "Contexto histórico.",
+    "contextoLiterario": "Género, estructura y flujo.",
     "propositoAutor": "Propósito original del autor.",
     "destinatarios": "Audiencia original.",
     "principioUniversal": "Principio ético/espiritual inmutable.",
     "aplicacionActual": "Aplicación contemporánea fiel.",
-    "pasajesRelacionados": ["Libro Cap:Ver - breve relación"],
+    "pasajesRelacionados": ["Libro Cap:Ver - relación breve"],
     "posiblesMalasInterpretaciones": [
-      { "interpretacion": "Lectura errónea común", "refutacion": "Refutación exegética rigurosa" }
+      { "interpretacion": "Lectura errónea común", "refutacion": "Refutación exegética" }
     ],
-    "conclusionExegetica": "Conclusión formal exegética."
+    "conclusionExegetica": "Conclusión exegética."
   }`
       : ""
   }${
@@ -767,10 +810,10 @@ Genera ÚNICAMENTE un JSON válido con estos campos exactos:
       ? `,
   "especificosCientificos": {
     "nivelEvidencia": "Jerarquía de evidencia científica disponible.",
-    "consensoCientifico": "Estado actual del consenso científico.",
+    "consensoCientifico": "Estado del consenso científico.",
     "limitacionesCientificas": "Brechas y limitaciones de los estudios.",
     "estudiosContradictorios": ["Línea de evidencia o hallazgos divergentes"],
-    "gradoCerteza": "Grado de certeza científica (Alto/Moderado/Bajo) y por qué."
+    "gradoCerteza": "Grado de certeza científica (Alto/Moderado/Bajo) y razón."
   }`
       : ""
   }
@@ -779,15 +822,15 @@ Genera ÚNICAMENTE un JSON válido con estos campos exactos:
 
     case "decision":
       return `${header}
-TAREA — ETAPA 3 DE 4 (Matriz de Decisiones, Recomendación, Riesgos y Plan de Implementación):
+TAREA — ETAPA 4 DE 7 (Matriz de Decisiones, Veredicto y Riesgos):
 Genera ÚNICAMENTE un JSON válido con estos campos exactos:
 {
   "matrizDecisiones": [
     {
-      "alternativa": "Alternativa realista (incluye 4 a 5 alternativas, considerando status quo e híbrida)",
-      "pros": ["Pro concreto 1", "Pro 2", "Pro 3"],
-      "contras": ["Contra concreto 1", "Contra 2", "Contra 3"],
-      "costo": "Bajo / Medio / Alto / Estimación",
+      "alternativa": "Alternativa realista (3 a 4 alternativas, incluyendo status quo e híbrida)",
+      "pros": ["Pro 1", "Pro 2", "Pro 3"],
+      "contras": ["Contra 1", "Contra 2", "Contra 3"],
+      "costo": "Bajo / Medio / Alto",
       "tiempo": "Inmediato / Corto / Mediano / Largo plazo",
       "riesgo": "Bajo / Medio / Alto",
       "beneficio": "Bajo / Medio / Alto",
@@ -797,64 +840,71 @@ Genera ÚNICAMENTE un JSON válido con estos campos exactos:
   ],
   "recomendacionFinal": {
     "recomendacion": "Recomendación estratégica clara y fundamentada.",
-    "justificacion": "Justificación detallada basada en evidencia y ponderación de alternativas.",
+    "justificacion": "Justificación sólida basada en evidencia y ponderación de alternativas.",
     "nivelConfianza": 88,
-    "porqueConfianza": "Razón explícita del porcentaje de confianza y qué factores lo limitan."
+    "porqueConfianza": "Razón explícita del porcentaje de confianza y factores limitantes."
   },
   "riesgos": [
     {
-      "riesgo": "Riesgo concreto (incluye 4 a 5 riesgos)",
+      "riesgo": "Riesgo concreto (3 a 4 riesgos)",
       "prevencion": "Medida concreta para evitarlo.",
       "solucion": "Plan de contingencia si ocurre."
     }
-  ],
+  ]
+}`;
+
+    case "accion":
+      return `${header}
+TAREA — ETAPA 5 DE 7 (Plan Paso a Paso, Acciones Prácticas y Checklist):
+Genera ÚNICAMENTE un JSON válido con estos campos exactos:
+{
   "planPasoAPaso": [
-    { "paso": 1, "titulo": "Título de fase (incluye 5 a 7 pasos secuenciales)", "descripcion": "Instrucciones concretas y ejecutables." }
+    { "paso": 1, "titulo": "Título de fase (4 a 6 pasos secuenciales)", "descripcion": "Instrucciones concretas y ejecutables." }
   ],
   "accionesPracticas": {
-    "inmediatas": ["3 acciones medibles para hoy/mañana"],
-    "estaSemana": ["3 acciones para los próximos 7 días"],
-    "esteMes": ["3 acciones para las próximas 4 semanas"],
-    "largoPlazo": ["3 hábitos o metas sostenibles"]
+    "inmediatas": ["2 a 3 acciones medibles para hoy/mañana"],
+    "estaSemana": ["2 a 3 acciones para los próximos 7 días"],
+    "esteMes": ["2 a 3 acciones para las próximas 4 semanas"],
+    "largoPlazo": ["2 a 3 hábitos o metas sostenibles"]
   },
   "erroresComunes": [
-    { "error": "Error frecuente (incluye 4 a 5 errores)", "comoEvitarlo": "Pauta práctica para evitarlo." }
+    { "error": "Error frecuente (3 a 4 errores)", "comoEvitarlo": "Pauta práctica para evitarlo." }
   ],
   "listaVerificacion": [
-    "6 a 8 criterios concretos de verificación"
+    "5 a 6 criterios concretos de verificación"
   ],
   "resumenFinal": {
-    "queHacer": ["3 a 5 acciones clave recomendadas"],
-    "queNoHacer": ["3 a 5 acciones desaconsejadas"],
+    "queHacer": ["3 a 4 acciones clave recomendadas"],
+    "queNoHacer": ["3 a 4 acciones desaconsejadas"],
     "porque": "Síntesis del fundamento de estas directrices."
   }
 }`;
 
-    case "validacion":
+    case "auditoria":
       return `${header}
-TAREA — ETAPA 4 DE 4 (Auditoría Crítica, Test Diagnóstico, Discernimiento y Recursos):
+TAREA — ETAPA 6 DE 7 (Auditoría de Razonamiento y Test Diagnóstico):
 Genera ÚNICAMENTE un JSON válido con estos campos exactos:
 {
   "auditoriaRazonamiento": {
-    "supuestosHechos": ["3 a 4 supuestos implícitos/explícitos del análisis"],
-    "evidenciaContradictoria": ["3 a 4 datos o argumentos que desafían la conclusión"],
-    "informacionFaltante": ["3 a 4 datos adicionales que elevarían la certeza"],
+    "supuestosHechos": ["3 supuestos implícitos/explícitos del análisis"],
+    "evidenciaContradictoria": ["3 datos o argumentos que desafían la conclusión"],
+    "informacionFaltante": ["3 datos adicionales que elevarían la certeza"],
     "sesgosCognitivos": [
-      { "sesgo": "Nombre del sesgo (3 a 4 sesgos)", "descripcion": "Definición breve.", "comoAfecta": "Cómo distorsiona este dilema específico." }
+      { "sesgo": "Nombre del sesgo (3 sesgos)", "descripcion": "Definición breve.", "comoAfecta": "Cómo distorsiona este dilema." }
     ],
-    "escenariosFalla": ["3 escenarios donde la recomendación dejaría de aplicar"],
-    "disparadoresCambio": ["3 señales o datos concretos que obligarían a cambiar de postura"]
+    "escenariosFalla": ["2 a 3 escenarios donde la recomendación dejaría de aplicar"],
+    "disparadoresCambio": ["2 a 3 señales concretas que obligarían a cambiar de postura"]
   },
   "testDiagnostico": {
-    "tituloTest": "Test Diagnóstico sobre ${topic.slice(0, 80)}",
-    "descripcion": "Cuestionario de 5 preguntas para medir dominio objetivo del tema y vulnerabilidad a sesgos psicológicos.",
+    "tituloTest": "Test Diagnóstico sobre ${topic.slice(0, 70)}",
+    "descripcion": "Cuestionario de 4 preguntas para evaluar dominio objetivo y sesgos psicológicos.",
     "preguntas": [
       {
         "id": 1,
-        "pregunta": "Pregunta precisa (incluye 5 a 6 preguntas)",
+        "pregunta": "Pregunta precisa (4 preguntas)",
         "dimension": "conocimiento | psicologico | ambos",
         "opciones": [
-          { "letra": "A", "texto": "Opción intuitiva o con mito común", "puntajeConocimiento": 5, "puntajePsicologico": 8, "explicacionEvaluativa": "Qué revela esta opción." },
+          { "letra": "A", "texto": "Opción intuitiva o con mito", "puntajeConocimiento": 5, "puntajePsicologico": 8, "explicacionEvaluativa": "Qué revela esta opción." },
           { "letra": "B", "texto": "Opción parcial", "puntajeConocimiento": 12, "puntajePsicologico": 14, "explicacionEvaluativa": "Evaluación intermedia." },
           { "letra": "C", "texto": "Opción sólida", "puntajeConocimiento": 20, "puntajePsicologico": 20, "explicacionEvaluativa": "Evaluación avanzada." },
           { "letra": "D", "texto": "Opción rigurosa y madura", "puntajeConocimiento": 25, "puntajePsicologico": 25, "explicacionEvaluativa": "Evaluación sobresaliente." }
@@ -871,10 +921,17 @@ Genera ÚNICAMENTE un JSON válido con estos campos exactos:
       "nivelModerado": "Disposición moderada con sesgos controlables.",
       "nivelVulnerable": "Alta vulnerabilidad emocional o sesgo."
     }
-  },
+  }
+}`;
+
+    case "recursos":
+      return `${header}
+TAREA — ETAPA 7 DE 7 (Discernimiento Profundo y Recursos Recomendados):
+Genera ÚNICAMENTE un JSON válido con estos campos exactos:
+{
   "teologiaEvangelica": {
     "evaluacionMotivosCorazon": {
-      "motivosSubyacentes": ["Motivaciones humanas profundas en juego"],
+      "motivosSubyacentes": ["2 a 3 motivaciones humanas profundas en juego"],
       "posiblesIdolosCorazon": ["Búsqueda de control, aprobación, comodidad, etc."],
       "consejoPastoralDeseos": "Consejo prudente, respetuoso y reflexivo sobre las motivaciones internas."
     },
@@ -888,20 +945,20 @@ Genera ÚNICAMENTE un JSON válido con estos campos exactos:
       "caida": "Cómo la fragilidad o el error distorsionan este tema.",
       "redencion": "Camino de restauración, gracia y sabiduría.",
       "consumacion": "Perspectiva de esperanza y trascendencia.",
-      "conexionEvangelio": "Síntesis respetuosa de cómo se conecta con la gracia (sin forzar dogma si el tema es estrictamente técnico)."
+      "conexionEvangelio": "Síntesis respetuosa conectada con la gracia (sin forzar dogma en temas estrictamente técnicos)."
     },
     "concordanciaOriginal": [
       {
-        "pasaje": "Pasaje pertinente o principio ético clásico",
+        "pasaje": "Pasaje pertinente o principio clásico",
         "palabrasOriginales": [
-          { "palabra": "Τérmino original", "transliteracion": "transliteracion", "idioma": "Griego | Hebreo", "strong": "G0000", "traduccionLiteral": "Traducción literal", "significadoTeologico": "Significado en contexto" }
+          { "palabra": "Término original", "transliteracion": "transliteracion", "idioma": "Griego | Hebreo", "strong": "G0000", "traduccionLiteral": "Traducción literal", "significadoTeologico": "Significado en contexto" }
         ],
         "contextoExegetico": "Nota breve de contexto."
       }
     ]
   },
   "recursosRecomendados": {
-    "libros": [{ "titulo": "Título real del libro (2-3 por categoría)", "autor": "Autor", "url": "" }],
+    "libros": [{ "titulo": "Título real (2 por categoría)", "autor": "Autor", "url": "" }],
     "articulos": [{ "titulo": "Artículo o referencia académica real", "url": "" }],
     "sitiosWeb": [{ "titulo": "Portal oficial reconocido", "url": "URL https:// real solo si estás 100% seguro, o \"\"" }],
     "videos": [{ "titulo": "Conferencia o canal educativo real", "url": "" }],
@@ -931,14 +988,14 @@ async function executeSingleStage(
   const userPrompt = buildStagePrompt(stage, topic, focusType, tradicionTeologica, partialData);
 
   const groundedSourcesPromise =
-    stage === "validacion"
+    stage === "recursos"
       ? fetchGroundedSourcesForTopic(ai, topic).catch(() => [] as GroundedWebSource[])
       : Promise.resolve([] as GroundedWebSource[]);
 
   const { parsedJson } = await generateContentWithRetryAndFallback(
     ai,
-    "gemini-3.1-flash-lite",
     "gemini-4-hydrogen",
+    "gemini-3.1-flash-lite",
     userPrompt,
     systemInstruction,
     { stageLabel: `Etapa ${stage}` }
@@ -946,7 +1003,7 @@ async function executeSingleStage(
 
   const safeStageFields = pickSafePartialAnalysisData(parsedJson);
 
-  if (stage === "validacion") {
+  if (stage === "recursos") {
     const rawRec = safeStageFields.recursosRecomendados || {};
     const sanitizedResources: RecommendedResources = {
       libros: sanitizeResourceList(rawRec.libros, "Libro recomendado"),
@@ -962,13 +1019,15 @@ async function executeSingleStage(
 
     const groundedSources = await Promise.race([
       groundedSourcesPromise,
-      new Promise<GroundedWebSource[]>((resolve) => setTimeout(() => resolve([]), 1500)),
+      new Promise<GroundedWebSource[]>((resolve) => setTimeout(() => resolve([]), 1200)),
     ]);
 
-    safeStageFields.recursosRecomendados = await enrichAndVerifyRecommendedResources(
-      sanitizedResources,
-      groundedSources
-    );
+    safeStageFields.recursosRecomendados = await Promise.race([
+      enrichAndVerifyRecommendedResources(sanitizedResources, groundedSources),
+      new Promise<RecommendedResources>((resolve) =>
+        setTimeout(() => resolve(sanitizedResources), 2200)
+      ),
+    ]);
   }
 
   return safeStageFields;
@@ -1490,8 +1549,8 @@ Contexto cercano del texto donde apareció: "${(typeof context === "string" ? co
 
       const { parsedJson } = await generateContentWithRetryAndFallback(
         ai,
-        "gemini-3.1-flash-lite",
         "gemini-4-hydrogen",
+        "gemini-3.1-flash-lite",
         userPrompt,
         systemInstruction,
         { stageLabel: "Diccionario" }

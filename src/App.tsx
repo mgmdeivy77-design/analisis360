@@ -97,7 +97,7 @@ const THEME_ICONS: Record<string, typeof Trees> = {
   midnight: Moon,
 };
 
-const ACTIVE_JOB_STORAGE_KEY = "sai_active_analysis_job";
+const ACTIVE_JOB_STORAGE_KEY = "sai_active_analysis_job_v2";
 const ACTIVE_JOB_MAX_AGE_MS = 2 * 60 * 60 * 1000;
 
 interface PersistedAnalysisJob {
@@ -703,14 +703,15 @@ export default function App() {
         let stageSucceeded = false;
         let lastErr: any = null;
 
-        // Up to 2 automatic attempts per stage on transient network/503 glitches
+        // Auto-retry ONLY on fast transient failures (< 8s); never double-wait after a timeout
         for (let attempt = 1; attempt <= 2; attempt++) {
           if (runController.signal.aborted || activeRunIdRef.current !== runId) return;
+          const attemptStartedAt = Date.now();
           try {
             const stageController = new AbortController();
             const onAbort = () => stageController.abort();
             runController.signal.addEventListener("abort", onAbort, { once: true });
-            const timer = setTimeout(() => stageController.abort(), 50000);
+            const timer = setTimeout(() => stageController.abort(), 38000);
 
             let res: Response;
             try {
@@ -761,11 +762,23 @@ export default function App() {
             break;
           } catch (err: any) {
             if (runController.signal.aborted || activeRunIdRef.current !== runId) return;
-            lastErr = err;
-            if (attempt < 2) {
+            const elapsedMs = Date.now() - attemptStartedAt;
+            const isAbortTimeout =
+              err?.name === "AbortError" ||
+              String(err?.message || "").toLowerCase().includes("time") ||
+              String(err?.message || "").includes("504");
+            lastErr =
+              err?.name === "AbortError"
+                ? new Error(
+                    "Esta etapa excedió el tiempo máximo de respuesta. Tu avance previo quedó guardado para continuar desde aquí."
+                  )
+                : err;
+            if (attempt < 2 && !isAbortTimeout && elapsedMs < 8000) {
               setReconnecting(true);
-              await new Promise((r) => setTimeout(r, 1400));
+              await new Promise((r) => setTimeout(r, 900));
+              continue;
             }
+            break;
           }
         }
 
@@ -920,7 +933,7 @@ export default function App() {
         executionMode: jobState.executionMode,
         status: "running",
         completedStages: filterValidStageIds(jobState.completedStages),
-        currentStage: jobState.currentStage || "base",
+        currentStage: jobState.currentStage || "sintesis",
         partialData: pickSafePartialAnalysisData(jobState.partialData),
         updatedAt: Date.now(),
       };
@@ -1812,7 +1825,9 @@ export default function App() {
                     className="px-3 py-1.5 rounded-lg bg-brand-bg border border-brand-border hover:border-brand-gold/50 text-xs font-semibold text-brand-text flex items-center gap-1.5 transition cursor-pointer"
                   >
                     <Eye className="w-3.5 h-3.5 text-brand-gold" />
-                    <span>Ver avance ({activeJob.completedStages.length}/4)</span>
+                    <span>
+                      Ver avance ({activeJob.completedStages.length}/{ANALYSIS_STAGE_ORDER.length})
+                    </span>
                   </button>
                 )}
                 <button
