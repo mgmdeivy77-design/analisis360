@@ -1,0 +1,6 @@
+{
+  "name": "Sistema de Análisis Integral",
+  "description": "Un motor avanzado de análisis, razonamiento, comparación y toma de decisiones multidisciplinarias con auditoría de razonamiento.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

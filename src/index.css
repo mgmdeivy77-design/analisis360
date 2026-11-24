@@ -1,0 +1,236 @@
+@import url('https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:ital,wght@0,400;0,500;0,600;0,700;0,800;1,400&family=Lora:ital,wght@0,400;0,500;0,600;0,700;1,400;1,600&family=JetBrains+Mono:wght@400;500;600;700&display=swap');
+@import "tailwindcss";
+
+@theme {
+  --font-sans: "Plus Jakarta Sans", ui-sans-serif, system-ui, sans-serif;
+  --font-display: "Lora", Georgia, serif;
+  --font-serif: "Lora", Georgia, serif;
+  --font-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, monospace;
+
+  --color-brand-bg: var(--theme-bg, #0e1612);
+  --color-brand-card: var(--theme-card, #14201a);
+  --color-brand-card-light: var(--theme-card-light, #1c2c24);
+  --color-brand-gold: var(--theme-gold, #6ec98f);
+  --color-brand-gold-hover: var(--theme-gold-hover, #58b87b);
+  --color-brand-text: var(--theme-text, #e8f1eb);
+  --color-brand-text-muted: var(--theme-text-muted, #94ab9c);
+  --color-brand-border: var(--theme-border, #21362a);
+  --color-brand-border-focus: var(--theme-border-focus, #325240);
+
+  --color-sem-emerald: var(--theme-sem-emerald, #34d399);
+  --color-sem-emerald-bg: var(--theme-sem-emerald-bg, rgba(16, 185, 129, 0.12));
+  --color-sem-emerald-border: var(--theme-sem-emerald-border, rgba(52, 211, 153, 0.28));
+
+  --color-sem-amber: var(--theme-sem-amber, #fbbf24);
+  --color-sem-amber-bg: var(--theme-sem-amber-bg, rgba(245, 158, 11, 0.12));
+  --color-sem-amber-border: var(--theme-sem-amber-border, rgba(251, 191, 36, 0.28));
+
+  --color-sem-rose: var(--theme-sem-rose, #fb7185);
+  --color-sem-rose-bg: var(--theme-sem-rose-bg, rgba(244, 63, 94, 0.12));
+  --color-sem-rose-border: var(--theme-sem-rose-border, rgba(251, 113, 133, 0.28));
+
+  --color-sem-sky: var(--theme-sem-sky, #38bdf8);
+  --color-sem-sky-bg: var(--theme-sem-sky-bg, rgba(14, 165, 233, 0.12));
+  --color-sem-sky-border: var(--theme-sem-sky-border, rgba(56, 189, 248, 0.28));
+
+  --color-sem-violet: var(--theme-sem-violet, #c084fc);
+  --color-sem-violet-bg: var(--theme-sem-violet-bg, rgba(168, 85, 247, 0.12));
+  --color-sem-violet-border: var(--theme-sem-violet-border, rgba(192, 132, 252, 0.28));
+}
+
+/* Default / Sage Green (Verde Bosque Descanso Visual) */
+:root, [data-theme="sage"] {
+  --theme-bg: #0e1612;
+  --theme-card: #14201a;
+  --theme-card-light: #1c2c24;
+  --theme-gold: #6ec98f;
+  --theme-gold-hover: #58b87b;
+  --theme-text: #e8f1eb;
+  --theme-text-muted: #94ab9c;
+  --theme-border: #21362a;
+  --theme-border-focus: #325240;
+
+  --theme-sem-emerald: #4ade80;
+  --theme-sem-emerald-bg: rgba(34, 197, 94, 0.11);
+  --theme-sem-emerald-border: rgba(74, 222, 128, 0.28);
+  --theme-sem-amber: #fbbf24;
+  --theme-sem-amber-bg: rgba(245, 158, 11, 0.11);
+  --theme-sem-amber-border: rgba(251, 191, 36, 0.28);
+  --theme-sem-rose: #fda4af;
+  --theme-sem-rose-bg: rgba(244, 63, 94, 0.11);
+  --theme-sem-rose-border: rgba(251, 113, 133, 0.28);
+  --theme-sem-sky: #7dd3fc;
+  --theme-sem-sky-bg: rgba(14, 165, 233, 0.11);
+  --theme-sem-sky-border: rgba(56, 189, 248, 0.28);
+  --theme-sem-violet: #d8b4fe;
+  --theme-sem-violet-bg: rgba(168, 85, 247, 0.11);
+  --theme-sem-violet-border: rgba(192, 132, 252, 0.28);
+}
+
+/* Sepia Lectura (Papel Pergamino Cálido - Claro) */
+[data-theme="sepia"] {
+  --theme-bg: #f4efe4;
+  --theme-card: #fcf9f2;
+  --theme-card-light: #eae2d2;
+  --theme-gold: #9a5b13;
+  --theme-gold-hover: #7f490c;
+  --theme-text: #241d17;
+  --theme-text-muted: #665b50;
+  --theme-border: #dcd2c0;
+  --theme-border-focus: #bfb199;
+
+  --theme-sem-emerald: #166534;
+  --theme-sem-emerald-bg: rgba(22, 163, 74, 0.10);
+  --theme-sem-emerald-border: rgba(22, 101, 52, 0.28);
+  --theme-sem-amber: #92400e;
+  --theme-sem-amber-bg: rgba(217, 119, 6, 0.11);
+  --theme-sem-amber-border: rgba(146, 64, 14, 0.28);
+  --theme-sem-rose: #9f1239;
+  --theme-sem-rose-bg: rgba(225, 29, 72, 0.09);
+  --theme-sem-rose-border: rgba(159, 18, 57, 0.28);
+  --theme-sem-sky: #075985;
+  --theme-sem-sky-bg: rgba(2, 132, 199, 0.10);
+  --theme-sem-sky-border: rgba(7, 89, 133, 0.28);
+  --theme-sem-violet: #6b21a8;
+  --theme-sem-violet-bg: rgba(126, 34, 206, 0.09);
+  --theme-sem-violet-border: rgba(107, 33, 168, 0.28);
+}
+
+/* Pizarra Oscura Carbón */
+[data-theme="slate"] {
+  --theme-bg: #131519;
+  --theme-card: #1b1e24;
+  --theme-card-light: #252932;
+  --theme-gold: #e0a458;
+  --theme-gold-hover: #ca8e43;
+  --theme-text: #eceef2;
+  --theme-text-muted: #939aa8;
+  --theme-border: #282d36;
+  --theme-border-focus: #3b4250;
+
+  --theme-sem-emerald: #4ade80;
+  --theme-sem-emerald-bg: rgba(34, 197, 94, 0.11);
+  --theme-sem-emerald-border: rgba(74, 222, 128, 0.28);
+  --theme-sem-amber: #fbbf24;
+  --theme-sem-amber-bg: rgba(245, 158, 11, 0.11);
+  --theme-sem-amber-border: rgba(251, 191, 36, 0.28);
+  --theme-sem-rose: #fda4af;
+  --theme-sem-rose-bg: rgba(244, 63, 94, 0.11);
+  --theme-sem-rose-border: rgba(251, 113, 133, 0.28);
+  --theme-sem-sky: #7dd3fc;
+  --theme-sem-sky-bg: rgba(14, 165, 233, 0.11);
+  --theme-sem-sky-border: rgba(56, 189, 248, 0.28);
+  --theme-sem-violet: #d8b4fe;
+  --theme-sem-violet-bg: rgba(168, 85, 247, 0.11);
+  --theme-sem-violet-border: rgba(192, 132, 252, 0.28);
+}
+
+/* Noche Azul Suave */
+[data-theme="midnight"] {
+  --theme-bg: #0c131d;
+  --theme-card: #131d2b;
+  --theme-card-light: #1b2a3d;
+  --theme-gold: #d6a756;
+  --theme-gold-hover: #bf9040;
+  --theme-text: #edf2f7;
+  --theme-text-muted: #92a4ba;
+  --theme-border: #1e2e42;
+  --theme-border-focus: #2d435e;
+
+  --theme-sem-emerald: #4ade80;
+  --theme-sem-emerald-bg: rgba(34, 197, 94, 0.11);
+  --theme-sem-emerald-border: rgba(74, 222, 128, 0.28);
+  --theme-sem-amber: #fbbf24;
+  --theme-sem-amber-bg: rgba(245, 158, 11, 0.11);
+  --theme-sem-amber-border: rgba(251, 191, 36, 0.28);
+  --theme-sem-rose: #fda4af;
+  --theme-sem-rose-bg: rgba(244, 63, 94, 0.11);
+  --theme-sem-rose-border: rgba(251, 113, 133, 0.28);
+  --theme-sem-sky: #7dd3fc;
+  --theme-sem-sky-bg: rgba(14, 165, 233, 0.11);
+  --theme-sem-sky-border: rgba(56, 189, 248, 0.28);
+  --theme-sem-violet: #d8b4fe;
+  --theme-sem-violet-bg: rgba(168, 85, 247, 0.11);
+  --theme-sem-violet-border: rgba(192, 132, 252, 0.28);
+}
+
+html, body {
+  width: 100%;
+  max-width: 100%;
+  overflow-x: clip;
+  background-color: var(--theme-bg, #0e1612);
+  color: var(--theme-text, #e8f1eb);
+  transition: background-color 0.25s ease, color 0.25s ease;
+  overscroll-behavior-y: contain;
+  -webkit-tap-highlight-color: transparent;
+}
+
+button, a, select, input, textarea {
+  touch-action: manipulation;
+}
+
+.tabular-nums {
+  font-variant-numeric: tabular-nums;
+}
+
+.pt-safe {
+  padding-top: env(safe-area-inset-top, 0px);
+}
+
+.pb-safe {
+  padding-bottom: env(safe-area-inset-bottom, 0px);
+}
+
+.pb-mobile-nav {
+  padding-bottom: calc(5rem + env(safe-area-inset-bottom, 0px));
+}
+
+@media (min-width: 768px) {
+  .pb-mobile-nav {
+    padding-bottom: 2rem;
+  }
+}
+
+.scroller-hidden {
+  -ms-overflow-style: none;
+  scrollbar-width: none;
+}
+.scroller-hidden::-webkit-scrollbar {
+  display: none;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}
+
+::-webkit-scrollbar {
+  width: 7px;
+  height: 7px;
+}
+
+::-webkit-scrollbar-track {
+  background: var(--theme-bg, #0e1612);
+}
+
+::-webkit-scrollbar-thumb {
+  background: var(--theme-border, #21362a);
+  border-radius: 4px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: var(--theme-gold, #6ec98f);
+}
+
+@media print {
+  header, nav, .no-print {
+    display: none !important;
+  }
+  body {
+    background: #ffffff !important;
+    color: #111827 !important;
+  }
+}
